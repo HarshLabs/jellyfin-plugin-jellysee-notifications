@@ -40,12 +40,14 @@ snapshot footer handle crashes and corruption. Journal corruption truncates the
 invalid tail; snapshot corruption moves the snapshot to `snapshot.bin.corrupt`.
 Every transition and transaction checks aggregate state bounds, including bulk
 rewrites; replay rejects the entire overflowing transaction or quarantines an
-invalid snapshot. File operations use a held directory handle, no-follow opens,
-exclusive random temporary files, handle identity/type/link checks and atomic
-replacement. Unix uses `openat`/`renameat`; Windows uses relative NT opens and
-handle-based renames. Existing files, including quarantine destinations, are
-never opened for truncation. Unsupported filesystem/platform primitives fail
-closed. Transient adapter/database failures retain the loop, subscriptions and
+invalid snapshot. Portable managed .NET file operations create random temporary
+files with `FileMode.CreateNew`, flush their contents with `Flush(true)`, then
+replace target entries with `File.Move(..., overwrite: true)`. Existing files,
+including quarantine destinations, are never opened for truncation. Existing
+read/append paths reject symbolic links and reparse points; directory checks keep
+state inside Jellyfin's plugin data path. Failed writes remove their temporary
+files, and bounded startup recovery reclaims abandoned random temporary entries.
+Transient adapter/database failures retain the loop, subscriptions and
 scan progress, report `adapterUnavailable`, and retry with exponential delays
 from one to sixty seconds. Shutdown cancellation remains separate.
 Disk write failure stops the worker and reports `stateUnavailable` without
@@ -142,6 +144,15 @@ records or static page content.
 
 **The server administrator and any installed plugin DLL share Jellyfin's process
 trust. This plugin cannot protect secrets or metadata against either actor.**
+Managed checks leave a **check-then-open window for the existing journal** and
+other path operations: an actor who can already write Jellyfin's own data
+directory could substitute an entry between validation and use. That actor has
+the same trust as the server process (the §8 trust-boundary table row), rather
+than being a relay or ordinary library user. .NET 9/10 expose no public hardlink
+count; existing hardlinks are read only and copied into fresh files before use
+as a writable journal. Hardlinks introduced afterward share the same trusted
+local-writer limitation. See [state storage and the §8 trust table](docs/state-storage.md)
+for the exact guarantees, cleanup bounds and residual races.
 The relay cannot choose a destination, path or file through a response. A
 compromised publisher can ship executable code: SHA-256 release hashes are a
 transparency aid, not authentication. Jellyfin's manifest MD5 checks only corruption.
@@ -177,5 +188,6 @@ cannot be configured in this local-only checkout. Run the plan's real-server
 10.11/12 deletion and reference-browsing visibility matrix, the 10,000-addition /
 2,000-deletion ≤5% performance gate, and an independent security review before
 publishing. Those integration and performance gates were not exercised here. The security
-regressions ran on macOS arm64; the Linux and Windows native storage backends
-compile in both builds but still require execution on those operating systems.
+regressions ran on macOS arm64 using managed storage; Linux x64/ARM64, macOS x64
+and Windows execution still require those platforms. Both target frameworks
+compile here, without native storage imports or architecture-specific layouts.

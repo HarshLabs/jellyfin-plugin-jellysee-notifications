@@ -28,6 +28,7 @@ public sealed class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
 {
     public const string PluginId = "467b751b-71c7-4e3d-a688-8ef46193d251";
     public Plugin(IApplicationPaths paths, IXmlSerializer serializer) : base(paths, serializer) => Instance = this;
+    internal string StateRootPath => ApplicationPaths.PluginsPath;
     public static Plugin? Instance { get; private set; }
     public override string Name => "JellySee Notifications";
     public override Guid Id => Guid.Parse(PluginId);

@@ -73,7 +73,7 @@ public sealed class NotificationService : BackgroundService
     private async Task Run(CancellationToken ct)
     {
         var plugin = Plugin.Instance ?? throw new InvalidOperationException();
-        using var journal = new Journal(plugin.DataFolderPath);
+        using var journal = new Journal(plugin.DataFolderPath, plugin.StateRootPath);
         string key = Identity.ServerKey(host.SystemId);
         var engine = new Engine(journal, compat, key);
         if (journal.RecoveredCorruption) SetError("stateRecovered");

@@ -1,6 +1,6 @@
 using System.Buffers.Binary;
 using System.Reflection;
-using System.Runtime.InteropServices;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Jellyfin.Plugin.JellySeeNotifications.Core;
@@ -12,16 +12,20 @@ namespace Jellyfin.Plugin.JellySeeNotifications.Tests;
 public sealed class SecurityRegressionTests
 {
     [Theory]
-    [InlineData("snapshot.tmp")]
-    [InlineData("snapshot.bin")]
-    [InlineData("journal.ndjson")]
-    public void PostStartupLinksCannotRedirectCompaction(string name)
+    [InlineData("snapshot.tmp", false)]
+    [InlineData("snapshot.bin", false)]
+    [InlineData("journal.ndjson", false)]
+    [InlineData("snapshot.tmp", true)]
+    [InlineData("snapshot.bin", true)]
+    [InlineData("journal.ndjson", true)]
+    public void PostStartupLinksCannotRedirectCompaction(string name, bool hardlink)
     {
         using var temp = new TempDirectory(); using var outside = new TempDirectory();
         string target = Path.Combine(outside.Path, "outside"); File.WriteAllText(target, "unchanged");
         using var journal = new Journal(temp.Path);
         journal.Commit(new Change { Kind = "notice", Notice = Event() });
-        string path = Path.Combine(temp.Path, name); File.Delete(path); File.CreateSymbolicLink(path, target);
+        string path = Path.Combine(temp.Path, name); File.Delete(path);
+        if (hardlink) CreateHardLink(path, target); else File.CreateSymbolicLink(path, target);
         journal.Compact();
         Assert.Equal("unchanged", File.ReadAllText(target));
         Assert.Equal(1, journal.State.Seq);
@@ -30,13 +34,19 @@ public sealed class SecurityRegressionTests
     [Theory]
     [InlineData("journal.ndjson")]
     [InlineData("snapshot.bin")]
-    public void ExistingHardLinksCannotBecomeWritableState(string name)
+    public void ExistingHardLinksAreCopiedBeforeAnyWrite(string name)
     {
         using var temp = new TempDirectory(); using var outside = new TempDirectory();
         string target = Path.Combine(outside.Path, "outside"); File.WriteAllText(target, "unchanged");
         string path = Path.Combine(temp.Path, name);
-        Assert.True(OperatingSystem.IsWindows() ? CreateHardLinkW(path, target, IntPtr.Zero) : link(target, path) == 0);
-        Assert.Throws<IOException>(() => new Journal(temp.Path));
+        CreateHardLink(path, target);
+        using (var journal = new Journal(temp.Path))
+        {
+            journal.Commit(new Change { Kind = "notice", Notice = Event() });
+            journal.Compact();
+        }
+        using var recovered = new Journal(temp.Path);
+        Assert.Single(recovered.State.Notices);
         Assert.Equal("unchanged", File.ReadAllText(target));
     }
     [Fact] public void ReplacedJournalLinkFailsBeforeAppendAndLeavesTargetUnchanged()
@@ -48,12 +58,16 @@ public sealed class SecurityRegressionTests
         Assert.Throws<StatePersistenceException>(() => journal.Commit(new Change { Kind = "notice", Notice = Event() }));
         Assert.Equal("unchanged", File.ReadAllText(target)); Assert.Empty(journal.State.Notices);
     }
-    [Fact] public void QuarantineDestinationLinkDoesNotTruncateOutsideFile()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void QuarantineDestinationLinkDoesNotTruncateOutsideFile(bool hardlink)
     {
         using var temp = new TempDirectory(); using var outside = new TempDirectory();
         string target = Path.Combine(outside.Path, "outside"); File.WriteAllText(target, "unchanged");
         File.WriteAllText(Path.Combine(temp.Path, "snapshot.bin"), "corrupt");
-        File.CreateSymbolicLink(Path.Combine(temp.Path, "snapshot.bin.corrupt"), target);
+        string quarantine = Path.Combine(temp.Path, "snapshot.bin.corrupt");
+        if (hardlink) CreateHardLink(quarantine, target); else File.CreateSymbolicLink(quarantine, target);
         using var recovered = new Journal(temp.Path);
         Assert.True(recovered.RecoveredCorruption); Assert.Equal("unchanged", File.ReadAllText(target));
         Assert.Equal("corrupt", File.ReadAllText(Path.Combine(temp.Path, "snapshot.bin.corrupt")));
@@ -67,12 +81,133 @@ public sealed class SecurityRegressionTests
             using (var journal = new Journal(temp.Path))
             {
                 Directory.Move(temp.Path, moved); Directory.CreateSymbolicLink(temp.Path, outside.Path);
-                journal.Commit(new Change { Kind = "notice", Notice = Event() }); journal.Compact();
+                Assert.Throws<StatePersistenceException>(() => journal.Commit(new Change { Kind = "notice", Notice = Event() }));
+                Assert.Throws<StatePersistenceException>(() => journal.Compact());
                 Assert.Empty(Directory.EnumerateFileSystemEntries(outside.Path));
             }
-            using var recovered = new Journal(moved); Assert.Single(recovered.State.Notices);
+            using var recovered = new Journal(moved); Assert.Empty(recovered.State.Notices);
         }
         finally { Directory.Delete(temp.Path); Directory.Move(moved, temp.Path); }
+    }
+    [Theory]
+    [InlineData("snapshot.bin", false)]
+    [InlineData("snapshot.bin", true)]
+    [InlineData("journal.ndjson", false)]
+    [InlineData("journal.ndjson", true)]
+    public void ExistingLinksAreRejectedBeforeRead(string name, bool dangling)
+    {
+        using var temp = new TempDirectory(); using var outside = new TempDirectory();
+        string target = Path.Combine(outside.Path, "outside");
+        if (!dangling) File.WriteAllText(target, "unchanged");
+        File.CreateSymbolicLink(Path.Combine(temp.Path, name), target);
+        Assert.Throws<IOException>(() => new Journal(temp.Path));
+        if (!dangling) Assert.Equal("unchanged", File.ReadAllText(target));
+        else Assert.False(File.Exists(target));
+    }
+    [Fact] public void StateDirectoryMustStayInsideTrustedPluginDataPath()
+    {
+        using var root = new TempDirectory(); using var outside = new TempDirectory();
+        Assert.Throws<IOException>(() => new Journal(outside.Path, root.Path));
+        Assert.Throws<IOException>(() => new Journal(root.Path, root.Path));
+        string escaped = Path.Combine(root.Path, "..", Path.GetFileName(outside.Path));
+        Assert.Throws<IOException>(() => new Journal(escaped, root.Path));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(outside.Path));
+    }
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void LinkedDirectoryOrAncestorIsRejected(bool ancestor)
+    {
+        using var root = new TempDirectory(); using var outside = new TempDirectory();
+        string link = Path.Combine(root.Path, "linked"); Directory.CreateSymbolicLink(link, outside.Path);
+        string directory = ancestor ? Path.Combine(link, "state") : link;
+        Assert.Throws<IOException>(() => new Journal(directory, root.Path));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(outside.Path));
+    }
+    [Fact] public void TrustedRootSubstitutionStopsFurtherWrites()
+    {
+        using var root = new TempDirectory(); using var outside = new TempDirectory();
+        string moved = root.Path + ".held";
+        try
+        {
+            using (var journal = new Journal(Path.Combine(root.Path, "state"), root.Path))
+            {
+                Directory.Move(root.Path, moved); Directory.CreateSymbolicLink(root.Path, outside.Path);
+                Assert.Throws<StatePersistenceException>(() => journal.Commit(new Change { Kind = "notice", Notice = Event() }));
+                Assert.Throws<StatePersistenceException>(() => journal.Compact());
+                Assert.Empty(Directory.EnumerateFileSystemEntries(outside.Path));
+            }
+        }
+        finally { Directory.Delete(root.Path); Directory.Move(moved, root.Path); }
+    }
+    [Fact] public void FailedCompactionRemovesItsTemporarySnapshot()
+    {
+        using var temp = new TempDirectory();
+        using var journal = new Journal(temp.Path);
+        journal.Commit(new Change { Kind = "notice", Notice = Event() });
+        Directory.CreateDirectory(Path.Combine(temp.Path, "snapshot.bin"));
+        for (int i = 0; i < 3; i++)
+        {
+            Assert.Throws<StatePersistenceException>(() => journal.Compact());
+            Assert.Empty(Directory.EnumerateFiles(temp.Path, "snapshot.tmp.*"));
+        }
+        Directory.Delete(Path.Combine(temp.Path, "snapshot.bin"));
+        journal.Compact();
+        Assert.Equal(2, Directory.EnumerateFileSystemEntries(temp.Path).Count());
+    }
+    [Theory]
+    [InlineData("journal.ndjson")]
+    [InlineData("snapshot.bin.corrupt")]
+    public void FailedRewriteRemovesItsTemporaryFile(string target)
+    {
+        using var temp = new TempDirectory();
+        Directory.CreateDirectory(Path.Combine(temp.Path, target));
+        using var files = new StateDirectory(temp.Path, Path.GetDirectoryName(temp.Path)!);
+        Assert.ThrowsAny<IOException>(() => files.Rewrite(target, null, 0));
+        Assert.Empty(Directory.EnumerateFiles(temp.Path, "*.tmp.*"));
+    }
+    [Fact] public void CopyFailureRemovesItsTemporaryFile()
+    {
+        using var temp = new TempDirectory();
+        using var files = new StateDirectory(temp.Path, Path.GetDirectoryName(temp.Path)!);
+        using var source = files.Create("source").Stream;
+        source.WriteByte(1);
+        Assert.Throws<IOException>(() => files.Rewrite("journal.ndjson", source, 2));
+        Assert.Empty(Directory.EnumerateFiles(temp.Path, "journal.ndjson.tmp.*"));
+        Assert.False(File.Exists(Path.Combine(temp.Path, "journal.ndjson")));
+    }
+    [Fact] public void StartupNeverRecursesIntoTemporaryDirectories()
+    {
+        using var temp = new TempDirectory(); using var outside = new TempDirectory();
+        string name = "snapshot.tmp." + Guid.NewGuid().ToString("N");
+        Directory.CreateSymbolicLink(Path.Combine(temp.Path, name), outside.Path);
+        string target = Path.Combine(outside.Path, "keep"); File.WriteAllText(target, "unchanged");
+        Assert.Throws<IOException>(() => new Journal(temp.Path));
+        Assert.Equal("unchanged", File.ReadAllText(target));
+    }
+    [Fact] public void StartupReclaimsOnlyOwnedRandomTemporaryEntriesWithoutFollowingLinks()
+    {
+        using var temp = new TempDirectory(); using var outside = new TempDirectory();
+        string target = Path.Combine(outside.Path, "outside"); File.WriteAllText(target, "unchanged");
+        string[] stale = ["snapshot.tmp." + Guid.NewGuid().ToString("N"), "journal.ndjson.tmp." + Guid.NewGuid().ToString("N"), "snapshot.bin.corrupt.tmp." + Guid.NewGuid().ToString("N")];
+        File.WriteAllText(Path.Combine(temp.Path, stale[0]), "abandoned");
+        File.CreateSymbolicLink(Path.Combine(temp.Path, stale[1]), target);
+        CreateHardLink(Path.Combine(temp.Path, stale[2]), target);
+        File.WriteAllText(Path.Combine(temp.Path, "snapshot.tmp.keep"), "keep");
+        using var journal = new Journal(temp.Path);
+        Assert.All(stale, name => Assert.False(File.Exists(Path.Combine(temp.Path, name))));
+        Assert.Equal("keep", File.ReadAllText(Path.Combine(temp.Path, "snapshot.tmp.keep")));
+        Assert.Equal("unchanged", File.ReadAllText(target));
+        Assert.Equal(new FileInfo(Path.Combine(temp.Path, "journal.ndjson")).Length, journal.DiskBytes);
+    }
+    [Fact] public void StartupRecoveryIsBoundedAndCanResumeOnNextStartup()
+    {
+        using var temp = new TempDirectory();
+        for (int i = 0; i < 130; i++) File.WriteAllText(Path.Combine(temp.Path, "snapshot.tmp." + Guid.NewGuid().ToString("N")), "stale");
+        Assert.Throws<IOException>(() => new Journal(temp.Path));
+        Assert.Equal(2, Directory.EnumerateFiles(temp.Path).Count());
+        using var recovered = new Journal(temp.Path);
+        Assert.Single(Directory.EnumerateFiles(temp.Path));
     }
     [Theory]
     [InlineData("pendingAdd")]
@@ -176,9 +311,18 @@ public sealed class SecurityRegressionTests
         var net10 = typeof(Engine).Assembly.GetName().Version;
         Assert.Equal(new Version(1, 0, 0, 0), net9); Assert.Equal(new Version(1, 0, 0, 1), net10); Assert.True(net10 > net9);
     }
-    [DllImport("libc", SetLastError = true)] private static extern int link(string existing, string path);
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool CreateHardLinkW(string path, string existing, IntPtr security);
+    // Fixture creation only. No handwritten native calls in either assembly.
+    private static void CreateHardLink(string path, string target)
+    {
+        var command = new ProcessStartInfo(OperatingSystem.IsWindows() ? "cmd.exe" : "/bin/ln") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
+        if (OperatingSystem.IsWindows()) { command.ArgumentList.Add("/c"); command.ArgumentList.Add("mklink"); command.ArgumentList.Add("/H"); }
+        command.ArgumentList.Add(OperatingSystem.IsWindows() ? path : target);
+        command.ArgumentList.Add(OperatingSystem.IsWindows() ? target : path);
+        using var process = Process.Start(command)!;
+        string output = process.StandardOutput.ReadToEnd() + process.StandardError.ReadToEnd();
+        Assert.True(process.WaitForExit(10000), "Hardlink fixture timed out");
+        Assert.True(process.ExitCode == 0, output);
+    }
     private static State FullQueue(string stage)
     {
         var state = new State();

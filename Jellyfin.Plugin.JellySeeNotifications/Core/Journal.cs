@@ -29,9 +29,9 @@ public sealed class Journal : IDisposable
     private sealed record Envelope(string Payload, string Sha256);
     private sealed record Header(long Seq, int Format);
 
-    public Journal(string directory)
+    public Journal(string directory, string? pluginDataPath = null)
     {
-        files = new StateDirectory(directory);
+        files = new StateDirectory(directory, pluginDataPath ?? Path.GetDirectoryName(Path.GetFullPath(directory))!);
         try { Load(); writer!.Seek(0, SeekOrigin.End); }
         catch { writer?.Dispose(); files.Dispose(); throw; }
     }
@@ -114,7 +114,7 @@ public sealed class Journal : IDisposable
             }
             catch (Exception ex) when (ex is JsonException or InvalidDataException or ArgumentException or NullReferenceException or OverflowException)
             {
-                // Copy through a new verified inode; never open/truncate an existing
+                // Copy through a new exclusive file; never open/truncate an existing
                 // quarantine destination, including an attacker-installed link.
                 using var quarantine = files.Rewrite("snapshot.bin.corrupt", snapshot, Math.Min(snapshot.Length, MaxFile));
                 files.Remove("snapshot.bin");
@@ -175,8 +175,9 @@ public sealed class Journal : IDisposable
     {
         State.ValidateInvariants();
         var temp = files.Create("snapshot.tmp");
-        using (var output = temp.Stream)
+        try
         {
+            using var output = temp.Stream;
             WriteLine(output, Encode(new Header(State.Seq, 3)));
             using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256); long count = 0;
             foreach (var c in State.Snapshot())
@@ -196,6 +197,11 @@ public sealed class Journal : IDisposable
             byte[] footer = new byte[40]; BinaryPrimitives.WriteInt64LittleEndian(footer.AsSpan(0, 8), count);
             digest.GetHashAndReset().CopyTo(footer, 8); output.Write(footer);
             files.Replace(temp.Name, output, "snapshot.bin");
+        }
+        finally
+        {
+            temp.Stream.Dispose();
+            files.Discard(temp.Name);
         }
         var replacement = files.Rewrite("journal.ndjson", null, 0);
         writer!.Dispose(); writer = replacement; operations = 0;
