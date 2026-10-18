@@ -59,6 +59,36 @@ public sealed class EngineTests
         var add = Assert.Single(journal.State.Notices).Value; Assert.Equal("add", add.Op); Assert.Equal(1, add.Life);
         Assert.Equal(1, journal.State.Index[Id(1)].Life);
     }
+    [Fact] public void UnreadyReplacementSuppressesRemovalBeforeTheFifteenMinuteFallbackAcrossRestart()
+    {
+        using var temp = new TempDirectory(); var fake = new FakeCompat { Refreshed = false }; fake.Add(1); fake.Add(2);
+        using (var journal = new Journal(temp.Path))
+        {
+            var engine = new Engine(journal, fake, "key"); engine.Index(fake.Get(Id(1))!);
+            engine.Remove(Id(1), Id(100), 1000, "");
+            engine.QueueAdd(Id(2), "Movie", Id(101), 1001, ""); engine.AdvanceAdds(1002, _ => { });
+            Assert.Equal("pendingAdd", journal.State.Notices[Id(101)].Stage);
+            Assert.Equal(1001, journal.State.Additions[Id(2)].At);
+            // History is separately bounded and may evict this still-pending replacement.
+            journal.Commit(new Change { Kind = "unaddition", Key = Id(2) }); journal.Compact();
+        }
+        using var restored = new Journal(temp.Path); var resumed = new Engine(restored, fake, "key");
+        resumed.AdvanceRemovals(1600, _ => { });
+        Assert.DoesNotContain(restored.State.Notices.Values, n => n.Op == "rm");
+        Assert.Equal("pendingAdd", Assert.Single(restored.State.Notices.Values).Stage);
+        resumed.AdvanceAdds(1901, _ => { });
+        var add = Assert.Single(restored.State.Notices.Values); Assert.Equal("add", add.Op); Assert.Equal("outbox", add.Stage); Assert.Equal(Id(101), add.EventId);
+        Assert.Equal(1, resumed.Life(Id(1)));
+    }
+    [Fact] public void UnreadyReplacementInAnotherLibraryDoesNotSuppressRemoval()
+    {
+        using var temp = new TempDirectory(); using var journal = new Journal(temp.Path);
+        var fake = new FakeCompat { Refreshed = false }; fake.Add(1); fake.Add(2); var engine = new Engine(journal, fake, "key");
+        engine.Index(fake.Get(Id(1))!); engine.Remove(Id(1), Id(100), 1000, ""); fake.Folders = [Id(9)];
+        engine.QueueAdd(Id(2), "Movie", Id(101), 1001, ""); engine.AdvanceAdds(1002, _ => { }); engine.AdvanceRemovals(1600, _ => { });
+        Assert.Contains(journal.State.Notices.Values, n => n.Op == "rm" && n.Stage == "outbox");
+        Assert.Contains(journal.State.Notices.Values, n => n.Op == "add" && n.Stage == "pendingAdd");
+    }
     [Fact] public void MoveBetweenLibrariesDoesNotSuppressRemoval()
     {
         using var temp = new TempDirectory(); using var journal = new Journal(temp.Path);

@@ -12,32 +12,28 @@ public sealed class Journal : IDisposable
     public const int MaxRecord = 128 * 1024;
     public const long MaxFile = 192L * 1024 * 1024;
     private static readonly JsonSerializerOptions Json = new() { MaxDepth = 12, UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow, DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
-    private readonly string directory;
+    private readonly StateDirectory files;
     private FileStream? writer;
     private long operations;
     public State State { get; private set; } = new();
     public bool RecoveredCorruption { get; private set; }
-    public long DiskBytes => new FileInfo(Path.Combine(directory, "journal.ndjson")).Length + (File.Exists(Path.Combine(directory, "snapshot.bin")) ? new FileInfo(Path.Combine(directory, "snapshot.bin")).Length : 0);
+    public long DiskBytes
+    {
+        get
+        {
+            try { return files.Length("journal.ndjson") + files.Length("snapshot.bin"); }
+            catch (IOException ex) { throw new StatePersistenceException(ex); }
+        }
+    }
     private sealed record Entry(long Seq, Change[] Changes);
     private sealed record Envelope(string Payload, string Sha256);
     private sealed record Header(long Seq, int Format);
 
     public Journal(string directory)
     {
-        this.directory = directory; Directory.CreateDirectory(directory);
-        RefuseLinks(directory);
-        Load();
-        writer = new FileStream(Path.Combine(directory, "journal.ndjson"), FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read);
-        writer.Seek(0, SeekOrigin.End);
-    }
-    private static void RefuseLinks(string directory)
-    {
-        if ((File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0) throw new IOException("Linked data directory");
-        foreach (string name in new[] { "journal.ndjson", "snapshot.bin", "snapshot.tmp" })
-        {
-            string path = Path.Combine(directory, name);
-            if (File.Exists(path) && (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0) throw new IOException("Linked data file");
-        }
+        files = new StateDirectory(directory);
+        try { Load(); writer!.Seek(0, SeekOrigin.End); }
+        catch { writer?.Dispose(); files.Dispose(); throw; }
     }
     private static byte[] Encode<T>(T value)
     {
@@ -74,12 +70,12 @@ public sealed class Journal : IDisposable
     private static void WriteLine(FileStream output, byte[] bytes) { output.Write(bytes); output.WriteByte((byte)'\n'); }
     private void Load()
     {
-        string snapshot = Path.Combine(directory, "snapshot.bin");
-        if (File.Exists(snapshot))
+        using var snapshot = files.Read("snapshot.bin");
+        if (snapshot is not null)
         {
             try
             {
-                using var input = new FileStream(snapshot, FileMode.Open, FileAccess.Read, FileShare.Read);
+                var input = snapshot;
                 if (input.Length > MaxFile) throw new InvalidDataException("Snapshot cap");
                 var header = Decode<Header>(Line(input) ?? throw new InvalidDataException());
                 if (header.Format != 3 || header.Seq < 0) throw new InvalidDataException();
@@ -118,12 +114,15 @@ public sealed class Journal : IDisposable
             }
             catch (Exception ex) when (ex is JsonException or InvalidDataException or ArgumentException or NullReferenceException or OverflowException)
             {
-                File.Move(snapshot, snapshot + ".corrupt", true); RecoveredCorruption = true;
+                // Copy through a new verified inode; never open/truncate an existing
+                // quarantine destination, including an attacker-installed link.
+                using var quarantine = files.Rewrite("snapshot.bin.corrupt", snapshot, Math.Min(snapshot.Length, MaxFile));
+                files.Remove("snapshot.bin");
+                RecoveredCorruption = true;
             }
         }
-        string journal = Path.Combine(directory, "journal.ndjson");
-        if (!File.Exists(journal)) return;
-        using var log = new FileStream(journal, FileMode.Open, FileAccess.ReadWrite, FileShare.Read);
+        using var log = files.Read("journal.ndjson");
+        if (log is null) { writer = files.Rewrite("journal.ndjson", null, 0); return; }
         long good = 0;
         try
         {
@@ -137,7 +136,6 @@ public sealed class Journal : IDisposable
                 {
                     if (entry.Seq != State.Seq + 1 || entry.Changes.Length > 256) throw new InvalidDataException("Sequence gap");
                     // Validate all changes against a bounded copy of the affected state before committing.
-                    ValidateTransaction(entry.Changes);
                     State.Transaction(entry.Changes);
                     State.Seq = entry.Seq;
                 }
@@ -145,26 +143,24 @@ public sealed class Journal : IDisposable
             }
         }
         catch (Exception ex) when (ex is JsonException or InvalidDataException or ArgumentException or NullReferenceException or OverflowException)
-        { log.SetLength(good); log.Flush(true); RecoveredCorruption = true; }
-    }
-    private void ValidateTransaction(Change[] changes)
-    {
-        // A tiny isolated state validates individual record shapes; capacity is checked by the writer.
-        foreach (var c in changes) { State test = new(); test.Apply(c); }
+        { RecoveredCorruption = true; }
+        // Recovery and future appends use a fresh exclusive inode. Existing hard
+        // links cannot turn a replay-tail repair into an outside-file truncation.
+        writer = files.Rewrite("journal.ndjson", log, good);
     }
     public void Commit(params Change[] changes)
     {
         try { CommitCore(changes); }
-        catch (IOException ex) when (ex is not StatePersistenceException) { throw new StatePersistenceException(ex); }
+        catch (Exception ex) when (ex is IOException and not StatePersistenceException or InvalidDataException or UnauthorizedAccessException) { throw new StatePersistenceException(ex); }
     }
     private void CommitCore(Change[] changes)
     {
-        if (changes.Length > 256) throw new InvalidDataException("Transaction cap");
-        ValidateTransaction(changes);
+        if (changes.Length is 0 or > 256) throw new InvalidDataException("Transaction cap");
         State.Transaction(changes, dryRun: true);
         long seq = checked(State.Seq + 1);
         byte[] bytes = Encode(new Entry(seq, changes));
         if (writer!.Length + bytes.Length + 1 > MaxFile / 2) Compact();
+        files.Verify("journal.ndjson", writer!);
         WriteLine(writer!, bytes); writer!.Flush(true);
         State.Transaction(changes);
         State.Seq = seq; operations++;
@@ -172,8 +168,14 @@ public sealed class Journal : IDisposable
     public void MaybeCompact() { if (operations >= 4096) Compact(); }
     public void Compact()
     {
-        string temp = Path.Combine(directory, "snapshot.tmp");
-        using (var output = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None))
+        try { CompactCore(); }
+        catch (Exception ex) when (ex is IOException and not StatePersistenceException or InvalidDataException or UnauthorizedAccessException) { throw new StatePersistenceException(ex); }
+    }
+    private void CompactCore()
+    {
+        State.ValidateInvariants();
+        var temp = files.Create("snapshot.tmp");
+        using (var output = temp.Stream)
         {
             WriteLine(output, Encode(new Header(State.Seq, 3)));
             using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256); long count = 0;
@@ -193,12 +195,12 @@ public sealed class Journal : IDisposable
             output.WriteByte(4);
             byte[] footer = new byte[40]; BinaryPrimitives.WriteInt64LittleEndian(footer.AsSpan(0, 8), count);
             digest.GetHashAndReset().CopyTo(footer, 8); output.Write(footer);
-            output.Flush(true);
+            files.Replace(temp.Name, output, "snapshot.bin");
         }
-        File.Move(temp, Path.Combine(directory, "snapshot.bin"), true);
-        writer!.SetLength(0); writer.Position = 0; writer.Flush(true); operations = 0;
+        var replacement = files.Rewrite("journal.ndjson", null, 0);
+        writer!.Dispose(); writer = replacement; operations = 0;
     }
-    public void Dispose() => writer?.Dispose();
+    public void Dispose() { writer?.Dispose(); files.Dispose(); }
 }
 
 public sealed class StatePersistenceException(Exception inner) : IOException("Plugin state could not be written", inner);

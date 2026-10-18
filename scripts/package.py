@@ -9,6 +9,7 @@ import re
 from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
 import zipfile
+from release_version import artifact_version
 
 ROOT = Path(__file__).resolve().parents[1]
 PROJECT = ROOT / 'Jellyfin.Plugin.JellySeeNotifications'
@@ -21,9 +22,10 @@ def main():
     ap.add_argument('--version', required=True)
     ap.add_argument('--notes', type=Path, required=True)
     args = ap.parse_args()
-    declared = ET.parse(PROJECT / 'Jellyfin.Plugin.JellySeeNotifications.csproj').findtext('.//Version')
+    declared = ET.parse(PROJECT / 'Jellyfin.Plugin.JellySeeNotifications.csproj').findtext('.//ReleaseVersion')
     if not re.fullmatch(r'\d+\.\d+\.\d+\.\d+', args.version) or args.version != declared:
         raise SystemExit('Tag version must match the four-part project version')
+    artifact_version(args.version, '12.0.0.0')  # validates reserved revision slot
     epoch = int(os.environ.get('SOURCE_DATE_EPOCH', '1767225600'))
     stamp = datetime.fromtimestamp(epoch, timezone.utc)
     notes = args.notes.read_text().strip()
@@ -32,7 +34,7 @@ def main():
     hashes = []
     for tfm, abi, suffix in [('net9.0', '10.11.0.0', 'jf10.11'), ('net10.0', '12.0.0.0', 'jf12')]:
         dll = PROJECT / 'bin' / 'Release' / tfm / NAME
-        meta = dict(guid=GUID, name='JellySee Notifications', version=args.version,
+        meta = dict(guid=GUID, name='JellySee Notifications', version=artifact_version(args.version, abi),
                     targetAbi=abi, description='Private library notifications for JellySee.',
                     overview='Audience-scoped library notifications.', owner='HarshLabs',
                     category='Notifications', assemblies=[NAME], changelog=notes,

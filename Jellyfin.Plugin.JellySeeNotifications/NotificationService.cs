@@ -58,7 +58,7 @@ public sealed class NotificationService : BackgroundService
         // Only this method owns the journal and all mutable state.
         try { await Run(ct); }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
-        catch (Exception ex) when (ex is not OutOfMemoryException)
+        catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException))
         {
             // Exceptions may embed paths, item names or request headers: never log their text.
             logger.LogError("[JellySee Notifications] Background service stopped (stateUnavailable)");
@@ -83,10 +83,10 @@ public sealed class NotificationService : BackgroundService
         string configStamp = "";
         int emptyPolls = 0;
         Dictionary<string, SendSchedule> schedules = new(StringComparer.Ordinal);
-        Queue<Library> libraries = new();
+        var reconciliation = new ReconcileQueue();
         Scan? scan = null;
         var sentAt = new Queue<long>();
-        while (!ct.IsCancellationRequested)
+        await IterationLoop.Run(async () =>
         {
             long now = Now;
             var config = plugin.Configuration;
@@ -111,7 +111,7 @@ public sealed class NotificationService : BackgroundService
                     case "update":
                         try { if (compat.Get(signal.Id) is { } item) engine.Index(item); }
                         catch (StatePersistenceException) { throw; }
-                        catch (Exception ex) when (ex is not OutOfMemoryException) { SetError("itemEvaluationFailed"); }
+                        catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException)) { SetError("itemEvaluationFailed"); }
                         break;
                     case "dirty": if (dirtyAt == 0) dirtyAt = now + 30; break;
                 }
@@ -136,15 +136,13 @@ public sealed class NotificationService : BackgroundService
                     catch (InvalidOperationException) { emptyPolls = 0; SetError("inventoryIncomplete"); }
                     nextInventory = now + 120;
                 }
-                if (dirtyAt != 0 && now >= dirtyAt || scan is null && now >= nextReconcile)
+                if (dirtyAt != 0 && now >= dirtyAt || now >= nextReconcile)
                 {
-                    scan = null;
-                    libraries = new Queue<Library>(journal.State.Libraries.Values.OrderBy(l => l.Id));
+                    reconciliation.Request();
                     nextReconcile = now + 900; dirtyAt = 0;
                 }
-                if (scan is null && libraries.Count != 0 && now >= nextLibrary)
+                if (scan is null && now >= nextLibrary && reconciliation.Next(journal.State.Libraries.Values) is { } folder)
                 {
-                    var folder = libraries.Dequeue();
                     if (journal.State.Libraries.Values.Any(l => l.Id == folder.Id))
                     {
                         try { scan = new Scan(folder, compat.Ids(folder.Id), journal.State.Seq, journal.State); }
@@ -267,8 +265,11 @@ public sealed class NotificationService : BackgroundService
             config.OutboxDepth = journal.State.Notices.Values.Count(n => n.Stage == "outbox");
             config.BaselineLibrariesRemaining = journal.State.Libraries.Values.Count(l => !l.BaselineComplete);
             journal.MaybeCompact();
-            await Task.Delay(TimeSpan.FromSeconds(1), ct);
-        }
+        }, code =>
+        {
+            if (code != "none" || error == "adapterUnavailable") SetError(code);
+            plugin.Configuration.Status = error;
+        }, ct);
     }
     private static bool ReconcileInventory(Journal journal, Engine engine, InventoryResult poll, long now, string setup)
     {
@@ -323,7 +324,7 @@ public static class Heartbeat
 {
     public static byte[] Encode(string server, State state, long now, string error, bool tooManyUsers, long bytes)
     {
-        string[] allowed = ["none", "relayUnreachable", "unauthorized", "tooManyUsers", "indexFull", "stateRecovered", "inventoryIncomplete", "itemEvaluationFailed", "reconcileFailed", "invalidConfiguration"];
+        string[] allowed = ["none", "relayUnreachable", "unauthorized", "tooManyUsers", "indexFull", "stateRecovered", "inventoryIncomplete", "itemEvaluationFailed", "reconcileFailed", "invalidConfiguration", "adapterUnavailable"];
         if (!allowed.Contains(error)) throw new InvalidDataException("Invalid health code");
         if (tooManyUsers) error = "tooManyUsers"; else if (state.Health.IndexFull) error = "indexFull";
         using var output = new MemoryStream();

@@ -85,13 +85,19 @@ public sealed class Engine(Journal journal, IJellyfinCompat compat, string serve
             {
                 var item = compat.Get(n.Id!);
                 if (item is null || !compat.IsTitle(item)) { journal.Commit(new Change() { Kind = "retire", Key = n.EventId }); continue; }
-                if (!compat.Ready(item, n.QueuedAt, now)) continue;
-                Index(item);
+                // Fingerprint a discovered replacement before readiness can delay it.
                 var description = compat.Describe(item, State.Seq, n.Life);
+                if (n.ProviderDigest != description.ProviderDigest || !n.Folders.SequenceEqual(description.Folders))
+                    Put(n with { ProviderDigest = description.ProviderDigest, Folders = description.Folders });
                 if (!State.Additions.ContainsKey(n.Id!) && State.Additions.Count >= State.Capacity)
                     journal.Commit(new Change() { Kind = "unaddition", Key = State.Additions.Values.MinBy(a => a.At)!.Id });
                 // Discovery time is the occurrence time, even when metadata took minutes.
-                journal.Commit(new Change() { Kind = "addition", Addition = new(n.Id!, description.Type, description.Folders, description.ProviderDigest, n.QueuedAt, n.SetupHash) });
+                var fingerprint = new Addition(n.Id!, description.Type, description.Folders, description.ProviderDigest, n.QueuedAt, n.SetupHash);
+                if (!State.Additions.TryGetValue(n.Id!, out var previous) || previous.At != fingerprint.At || previous.SetupHash != fingerprint.SetupHash ||
+                    previous.Type != fingerprint.Type || previous.ProviderDigest != fingerprint.ProviderDigest || !previous.Folders.SequenceEqual(fingerprint.Folders))
+                    journal.Commit(new Change() { Kind = "addition", Addition = fingerprint });
+                if (!compat.Ready(item, n.QueuedAt, now)) continue;
+                Index(item);
                 var audience = compat.Audience(item, description.Folders, serverKey);
                 if (audience.Length == 0)
                 {
@@ -107,8 +113,12 @@ public sealed class Engine(Journal journal, IJellyfinCompat compat, string serve
     public void AdvanceRemovals(long now, Action<string> error)
     {
         var pending = State.Notices.Values.Where(n => n.Stage == "pendingRemove").OrderBy(n => n.QueuedAt).ToArray();
+        // Pending fingerprints also survive history eviction while readiness is
+        // delayed; they have their own bounded queue and persisted occurrence time.
+        var replacements = State.Additions.Values.Concat(State.Notices.Values.Where(n => n.Stage == "pendingAdd")
+            .Select(n => new Addition(n.Id!, n.Type!, n.Folders, n.ProviderDigest, n.QueuedAt, n.SetupHash))).ToArray();
         foreach (var n in pending)
-            if (State.Additions.Values.Any(a => Rules.Upgrade(n, a))) journal.Commit(new Change() { Kind = "retire", Key = n.EventId });
+            if (replacements.Any(a => Rules.Upgrade(n, a))) journal.Commit(new Change() { Kind = "retire", Key = n.EventId });
         // Keep a whole ten-minute window until every member can be upgrade-checked. This avoids
         // splitting a burst at the exact ten-minute boundary and missing the >200 threshold.
         foreach (var route in State.Notices.Values.Where(n => n.Stage == "pendingRemove").SelectMany(n => n.Folders.Select(f => (Folder: f, Setup: n.SetupHash))).Distinct().ToArray())

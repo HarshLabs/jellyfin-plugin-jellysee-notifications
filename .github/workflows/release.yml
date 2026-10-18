@@ -29,8 +29,8 @@ jobs:
           import os, re, pathlib, subprocess, xml.etree.ElementTree as ET
           tag = os.environ['RELEASE_TAG']
           version = tag.removeprefix('v')
-          declared = ET.parse('Jellyfin.Plugin.JellySeeNotifications/Jellyfin.Plugin.JellySeeNotifications.csproj').findtext('.//Version')
-          if not re.fullmatch(r'v\d+\.\d+\.\d+\.\d+', tag) or version != declared:
+          declared = ET.parse('Jellyfin.Plugin.JellySeeNotifications/Jellyfin.Plugin.JellySeeNotifications.csproj').findtext('.//ReleaseVersion')
+          if not re.fullmatch(r'v\d+\.\d+\.\d+\.0', tag) or version != declared:
               raise SystemExit('Tag must match project version')
           notes = subprocess.check_output(['git', 'for-each-ref', '--format=%(contents)', 'refs/tags/' + tag], text=True).strip()
           if not notes:
@@ -43,6 +43,7 @@ jobs:
       - run: dotnet restore --locked-mode
       - run: dotnet build -c Release --no-restore
       - run: dotnet test -c Release --no-build --no-restore
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - run: python3 scripts/package.py --version "$RELEASE_VERSION" --notes release-notes.txt
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

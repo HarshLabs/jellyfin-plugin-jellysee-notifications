@@ -1,8 +1,10 @@
 # JellySee Notifications
 
-Jellyfin plugin 1.0.0.0 for audience-scoped library notifications in JellySee.
+Jellyfin plugin release 1.0.0.0 for audience-scoped library notifications in JellySee.
 Separate binaries support Jellyfin **10.11** (.NET 9, Controller/Model 10.11.8)
-and **12** (.NET 10, Controller/Model 12.0.0-rc3). Jellyfin 10.10 is unsupported.
+and **12** (.NET 10, Controller/Model 12.0.0-rc3). The 10.11 DLL/package version is
+**1.0.0.0**; the 12 DLL/package version is **1.0.0.1**, so upgrading the server
+also offers a strictly newer compatible plugin. Jellyfin 10.10 is unsupported.
 The repository starts with an empty release-version list; nothing here has been
 published or deployed.
 
@@ -36,6 +38,16 @@ The durable journal records transitions before changing the index. Checksums,
 streaming reads, per-record limits, an atomic snapshot rename and a complete
 snapshot footer handle crashes and corruption. Journal corruption truncates the
 invalid tail; snapshot corruption moves the snapshot to `snapshot.bin.corrupt`.
+Every transition and transaction checks aggregate state bounds, including bulk
+rewrites; replay rejects the entire overflowing transaction or quarantines an
+invalid snapshot. File operations use a held directory handle, no-follow opens,
+exclusive random temporary files, handle identity/type/link checks and atomic
+replacement. Unix uses `openat`/`renameat`; Windows uses relative NT opens and
+handle-based renames. Existing files, including quarantine destinations, are
+never opened for truncation. Unsupported filesystem/platform primitives fail
+closed. Transient adapter/database failures retain the loop, subscriptions and
+scan progress, report `adapterUnavailable`, and retry with exponential delays
+from one to sixty seconds. Shutdown cancellation remains separate.
 Disk write failure stops the worker and reports `stateUnavailable` without
 printing exception text.
 
@@ -43,10 +55,12 @@ An initial baseline indexes existing titles without announcing historical import
 It resumes from persisted discovery knowledge after a restart. Each library has
 one unpaged, server-wide, ids-only `GetItemIds` query using its physical roots;
 only logical CollectionFolder IDs appear in events. Passes run at startup and
-at least every fifteen minutes, with library queries spaced five seconds apart.
+on a fifteen-minute schedule, with library queries spaced five seconds apart.
+Timer, inventory and dirty requests coalesce into a follow-up pass while the
+current scan and its unvisited libraries finish, even if a pass exceeds fifteen minutes.
 Each tick processes up to 1,000 titles and index writes are committed in groups
 of up to 100 changes. Container changes trigger an all-library pass within a
-coalesced thirty-second window. Every regular pass also refreshes folder and
+coalesced thirty-second window; an active pass finishes before the follow-up begins. Every regular pass also refreshes folder and
 provider fingerprints, covering the daily full-reconcile requirement.
 
 Library inventory is checked every two minutes using `GetVirtualFolders()` plus
@@ -59,8 +73,10 @@ cannot conceal a deleted library. A library disappearance journals one
 Every processed title removal increments its lifecycle counter, including an
 upgrade whose removal is suppressed. Tombstones last twenty-four hours; lifecycle counters persist after tombstones expire. A removal
 waits ten minutes for an equal, nonempty provider fingerprint, type and folder set
-on an addition within ten minutes in either direction. The addition is always
-retained. More than 200 unsuppressed removals in a ten-minute window produce one
+on an addition within ten minutes in either direction. Replacement fingerprints
+are persisted before metadata readiness, both in bounded history and on the
+pending addition, so the fifteen-minute fallback or history eviction cannot
+release a matching upgrade removal. The addition is always retained. More than 200 unsuppressed removals in a ten-minute window produce one
 `rmbulk` for each affected library, with its own audience. Bulk windows wait for
 their newest member's upgrade hold to finish; this can add up to ten minutes to
 the removal delay. Shared-library removals retain each library's route.
@@ -145,8 +161,12 @@ python3 scripts/package.py --version 1.0.0.0 --notes path/to/release-notes.txt
 The package contains the plugin DLL, `meta.json` and license; it excludes Jellyfin
 and all third-party assemblies. The tag-only release workflow validates the project
 version, builds/tests with locked NuGet packages, then publishes both ABI archives
-and SHA-256 hashes. A separate publishing job updates the manifest with the higher
-ABI first, using its own Contents write permission. Actions are pinned to SHAs
+and SHA-256 hashes. Release tags reserve revision zero (`x.y.z.0`); the 12
+artifact uses revision one (`x.y.z.1`) in its DLL, metadata and manifest, while
+both archive filenames use the release tag version. A separate publishing job
+updates the manifest using its own Contents write permission. The offline tests
+model the ABI filtering and strictly-greater update selection checked against
+both Jellyfin source tags; see [the migration notes](docs/abi-migration.md). Actions are pinned to SHAs
 from the local Jellyfin reference workflows. The build job has read permission
 and no persisted checkout credentials.
 
@@ -156,4 +176,6 @@ scoped branch-protection exception if required. These remote repository controls
 cannot be configured in this local-only checkout. Run the plan's real-server
 10.11/12 deletion and reference-browsing visibility matrix, the 10,000-addition /
 2,000-deletion ≤5% performance gate, and an independent security review before
-publishing. Those integration and performance gates were not exercised here.
+publishing. Those integration and performance gates were not exercised here. The security
+regressions ran on macOS arm64; the Linux and Windows native storage backends
+compile in both builds but still require execution on those operating systems.

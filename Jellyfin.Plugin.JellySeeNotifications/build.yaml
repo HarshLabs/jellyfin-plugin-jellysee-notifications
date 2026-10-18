@@ -8,6 +8,7 @@ description: |
   Sends only ids, pseudonymous audience hashes and health information to the
   JellySee relay for library additions and removals. No titles or paths leave
   the server. Supports Jellyfin 10.11 and 12 with separate builds.
+  This metadata describes 10.11 version 1.0.0.0; packaging assigns 1.0.0.1 to ABI 12.
 category: Notifications
 owner: HarshLabs
 artifacts:

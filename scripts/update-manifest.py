@@ -1,24 +1,10 @@
 #!/usr/bin/env python3
-"""Add this release's per-ABI builds to manifest.json.
+"""Publish per-ABI versions: release x.y.z.0 on 10.11, x.y.z.1 on 12.
 
-Why not `jprm repo add`? It de-duplicates by version string, so adding a second
-artifact for the same version *replaces* the first. This plugin ships one build
-per Jellyfin major (net9.0/ABI 10.11.0.0 and net10.0/ABI 12.0.0.0) under a
-single version number, so jprm would silently drop one of them — leaving the
-older-server audience stranded on the previous release.
-
-Ordering matters. Jellyfin filters the version list to entries whose targetAbi
-its own version satisfies, then sorts by version descending. That sort is
-stable, so among entries sharing a version the original array order decides.
-Emitting the HIGHEST targetAbi first therefore means:
-
-  * a 12.x server sees both entries, and the 12 build wins the tie;
-  * a 10.11 server never sees the 12 entry at all (its targetAbi is too high)
-    and lands on the 10.11 build.
-
-Usage:
-  update-manifest.py --version 1.2.0.0 --changelog-file notes.txt \\
-      --entry <zip>=<targetAbi>=<download-url> [--entry ...]
+Both InstallationManager versions filter targetAbi <= server version, sort by
+plugin version descending, and require a strictly newer installed-plugin version.
+The revision increment allows automatic ABI migration after a server upgrade.
+Archive names and release tags continue to use x.y.z.0 for both artifacts.
 """
 import argparse
 import hashlib
@@ -26,6 +12,8 @@ import json
 import pathlib
 import sys
 from datetime import datetime, timezone
+from release_version import artifact_version
+import zipfile
 
 
 def md5(path: pathlib.Path) -> str:
@@ -66,9 +54,14 @@ def main() -> int:
         if not zip_path.is_file():
             print(f"missing artifact: {zip_path}", file=sys.stderr)
             return 1
+        version = artifact_version(args.version, abi)
+        with zipfile.ZipFile(zip_path) as archive:
+            meta = json.loads(archive.read('meta.json'))
+        if meta['version'] != version or meta['targetAbi'] != abi:
+            raise ValueError('Package metadata does not match ABI version')
         entries.append(
             {
-                "version": args.version,
+                "version": version,
                 "changelog": changelog,
                 "targetAbi": abi,
                 "sourceUrl": url,
@@ -77,13 +70,10 @@ def main() -> int:
             }
         )
 
-    # Re-running a release must not accumulate duplicates.
-    versions[:] = [v for v in versions if v.get("version") != args.version]
-
-    # Highest targetAbi first — see the module docstring for why this is what
-    # steers each server to the right build.
-    entries.sort(key=lambda e: [int(p) for p in e["targetAbi"].split(".")], reverse=True)
-    versions[:0] = entries
+    # Remove both revisions (also cleans up old same-version dual-ABI entries).
+    release_versions = {artifact_version(args.version, abi) for abi in ('10.11.0.0', '12.0.0.0')}
+    versions[:] = [v for v in versions if v.get("version") not in release_versions] + entries
+    versions.sort(key=lambda e: (tuple(map(int, e['version'].split('.'))), tuple(map(int, e['targetAbi'].split('.')))), reverse=True)
 
     manifest_path.write_text(json.dumps(manifest, indent=4) + "\n")
     for entry in entries:
