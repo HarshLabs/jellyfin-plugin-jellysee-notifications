@@ -1,0 +1,92 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: |
+            9.0.x
+            10.0.x
+      - name: Validate tag and prepare notes
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os, re, pathlib, subprocess, xml.etree.ElementTree as ET
+          tag = os.environ['RELEASE_TAG']
+          version = tag.removeprefix('v')
+          declared = ET.parse('Jellyfin.Plugin.JellySeeNotifications/Jellyfin.Plugin.JellySeeNotifications.csproj').findtext('.//Version')
+          if not re.fullmatch(r'v\d+\.\d+\.\d+\.\d+', tag) or version != declared:
+              raise SystemExit('Tag must match project version')
+          notes = subprocess.check_output(['git', 'for-each-ref', '--format=%(contents)', 'refs/tags/' + tag], text=True).strip()
+          if not notes:
+              notes = subprocess.check_output(['git', 'log', '-1', '--pretty=%s'], text=True).strip()
+          pathlib.Path('release-notes.txt').write_text(notes + '\n')
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write('RELEASE_VERSION=' + version + '\n')
+              env.write('SOURCE_DATE_EPOCH=' + subprocess.check_output(['git', 'show', '-s', '--format=%ct', 'HEAD'], text=True).strip() + '\n')
+          PY
+      - run: dotnet restore --locked-mode
+      - run: dotnet build -c Release --no-restore
+      - run: dotnet test -c Release --no-build --no-restore
+      - run: python3 scripts/package.py --version "$RELEASE_VERSION" --notes release-notes.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: |
+            dist/*
+            release-notes.txt
+          if-no-files-found: error
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+      - name: Publish tag assets and manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          { cat release-notes.txt; echo; echo 'SHA-256 transparency hashes (not a signature):'; cat dist/SHA256SUMS.txt; } > release-body.txt
+          gh release create "$RELEASE_TAG" dist/*.zip dist/SHA256SUMS.txt --verify-tag --title "$RELEASE_TAG" --notes-file release-body.txt
+          git fetch origin main
+          git checkout -B main origin/main
+          BASE="https://github.com/$REPOSITORY/releases/download/$RELEASE_TAG"
+          python3 scripts/update-manifest.py --version "$VERSION" --changelog-file release-notes.txt \
+            --entry "dist/jellysee-notifications_${VERSION}_jf10.11.zip=10.11.0.0=$BASE/jellysee-notifications_${VERSION}_jf10.11.zip" \
+            --entry "dist/jellysee-notifications_${VERSION}_jf12.zip=12.0.0.0=$BASE/jellysee-notifications_${VERSION}_jf12.zip"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add manifest.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Publish $RELEASE_TAG to manifest"
+            gh auth setup-git
+            git push origin HEAD:main
+          fi

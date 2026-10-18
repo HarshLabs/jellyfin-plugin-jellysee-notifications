@@ -1,0 +1,48 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Jellyfin.Plugin.JellySeeNotifications", "Jellyfin.Plugin.JellySeeNotifications\Jellyfin.Plugin.JellySeeNotifications.csproj", "{F5F2D086-238B-4082-B61C-E2042DD71347}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Jellyfin.Plugin.JellySeeNotifications.Tests", "Jellyfin.Plugin.JellySeeNotifications.Tests\Jellyfin.Plugin.JellySeeNotifications.Tests.csproj", "{993FE1C6-E741-4EFB-98C3-C598BA7E95EB}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Debug|x64 = Debug|x64
+		Debug|x86 = Debug|x86
+		Release|Any CPU = Release|Any CPU
+		Release|x64 = Release|x64
+		Release|x86 = Release|x86
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{F5F2D086-238B-4082-B61C-E2042DD71347}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{F5F2D086-238B-4082-B61C-E2042DD71347}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{F5F2D086-238B-4082-B61C-E2042DD71347}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{F5F2D086-238B-4082-B61C-E2042DD71347}.Debug|x64.Build.0 = Debug|Any CPU
+		{F5F2D086-238B-4082-B61C-E2042DD71347}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{F5F2D086-238B-4082-B61C-E2042DD71347}.Debug|x86.Build.0 = Debug|Any CPU
+		{F5F2D086-238B-4082-B61C-E2042DD71347}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{F5F2D086-238B-4082-B61C-E2042DD71347}.Release|Any CPU.Build.0 = Release|Any CPU
+		{F5F2D086-238B-4082-B61C-E2042DD71347}.Release|x64.ActiveCfg = Release|Any CPU
+		{F5F2D086-238B-4082-B61C-E2042DD71347}.Release|x64.Build.0 = Release|Any CPU
+		{F5F2D086-238B-4082-B61C-E2042DD71347}.Release|x86.ActiveCfg = Release|Any CPU
+		{F5F2D086-238B-4082-B61C-E2042DD71347}.Release|x86.Build.0 = Release|Any CPU
+		{993FE1C6-E741-4EFB-98C3-C598BA7E95EB}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{993FE1C6-E741-4EFB-98C3-C598BA7E95EB}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{993FE1C6-E741-4EFB-98C3-C598BA7E95EB}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{993FE1C6-E741-4EFB-98C3-C598BA7E95EB}.Debug|x64.Build.0 = Debug|Any CPU
+		{993FE1C6-E741-4EFB-98C3-C598BA7E95EB}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{993FE1C6-E741-4EFB-98C3-C598BA7E95EB}.Debug|x86.Build.0 = Debug|Any CPU
+		{993FE1C6-E741-4EFB-98C3-C598BA7E95EB}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{993FE1C6-E741-4EFB-98C3-C598BA7E95EB}.Release|Any CPU.Build.0 = Release|Any CPU
+		{993FE1C6-E741-4EFB-98C3-C598BA7E95EB}.Release|x64.ActiveCfg = Release|Any CPU
+		{993FE1C6-E741-4EFB-98C3-C598BA7E95EB}.Release|x64.Build.0 = Release|Any CPU
+		{993FE1C6-E741-4EFB-98C3-C598BA7E95EB}.Release|x86.ActiveCfg = Release|Any CPU
+		{993FE1C6-E741-4EFB-98C3-C598BA7E95EB}.Release|x86.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal

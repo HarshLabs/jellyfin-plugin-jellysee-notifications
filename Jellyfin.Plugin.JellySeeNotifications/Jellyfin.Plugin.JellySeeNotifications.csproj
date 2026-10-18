@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net9.0;net10.0</TargetFrameworks>
+    <Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Jellyfin.Plugin.JellySeeNotifications</RootNamespace>
+    <AssemblyName>Jellyfin.Plugin.JellySeeNotifications</AssemblyName>
+    <Version>1.0.0.0</Version><AssemblyVersion>1.0.0.0</AssemblyVersion><FileVersion>1.0.0.0</FileVersion>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <Deterministic>true</Deterministic><DebugType>embedded</DebugType>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+  <ItemGroup><FrameworkReference Include="Microsoft.AspNetCore.App" /></ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net9.0'">
+    <PackageReference Include="Jellyfin.Controller" Version="10.11.8" />
+    <PackageReference Include="Jellyfin.Model" Version="10.11.8" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+    <PackageReference Include="Jellyfin.Controller" Version="12.0.0-rc3" />
+    <PackageReference Include="Jellyfin.Model" Version="12.0.0-rc3" />
+  </ItemGroup>
+  <PropertyGroup Condition="'$(TargetFramework)' == 'net10.0'"><DefineConstants>$(DefineConstants);JELLYFIN_12</DefineConstants></PropertyGroup>
+  <ItemGroup><EmbeddedResource Include="Configuration/configPage.html" /></ItemGroup>
+</Project>

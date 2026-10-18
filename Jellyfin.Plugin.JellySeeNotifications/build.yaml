@@ -1,0 +1,16 @@
+name: JellySee Notifications
+guid: 467b751b-71c7-4e3d-a688-8ef46193d251
+version: 1.0.0.0
+targetAbi: 10.11.0.0
+framework: net9.0
+overview: Audience-scoped JellySee library notifications.
+description: |
+  Sends only ids, pseudonymous audience hashes and health information to the
+  JellySee relay for library additions and removals. No titles or paths leave
+  the server. Supports Jellyfin 10.11 and 12 with separate builds.
+category: Notifications
+owner: HarshLabs
+artifacts:
+  - Jellyfin.Plugin.JellySeeNotifications.dll
+changelog: |
+  Initial release.

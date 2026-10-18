@@ -1,0 +1,11 @@
+[
+    {
+        "guid": "467b751b-71c7-4e3d-a688-8ef46193d251",
+        "name": "JellySee Notifications",
+        "description": "Audience-scoped library addition and removal notifications for JellySee. Only ids, hashes and health values leave the server.",
+        "overview": "Private library notifications for JellySee.",
+        "owner": "HarshLabs",
+        "category": "Notifications",
+        "versions": []
+    }
+]

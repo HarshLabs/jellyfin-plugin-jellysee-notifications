@@ -1,0 +1,9 @@
+**/bin/
+**/obj/
+artifacts/
+dist/
+TestResults/
+.DS_Store
+*.user
+__pycache__/
+*.pyc

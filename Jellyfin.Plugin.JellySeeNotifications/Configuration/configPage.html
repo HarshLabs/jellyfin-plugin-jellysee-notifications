@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html><head><title>JellySee Notifications</title></head><body>
+<div id="JellySeeNotificationsPage" data-role="page" class="page type-interior pluginConfigurationPage">
+<div data-role="content"><div class="content-primary">
+<form id="JellySeeNotificationsForm">
+<h2>JellySee Notifications</h2>
+<p>Send library addition and removal ids to the JellySee relay. Titles, paths and usernames stay on this server.</p>
+<div class="checkboxContainer checkboxContainer-withDescription"><label><input is="emby-checkbox" type="checkbox" id="Enabled"><span>Enable notifications</span></label></div>
+<div class="inputContainer"><label class="inputLabel" for="Secret">Replace relay secret</label>
+<input is="emby-input" type="password" id="Secret" autocomplete="new-password">
+<div class="fieldDescription">Write only. Leave blank to keep the configured secret. Use the same secret as JellySee's Webhook integration.</div></div>
+<div class="checkboxContainer"><label><input is="emby-checkbox" type="checkbox" id="ClearSecret"><span>Clear the configured secret</span></label></div>
+<p id="Status" role="status"></p>
+<button is="emby-button" type="submit" class="raised button-submit block"><span>Save</span></button>
+</form></div></div>
+<script>
+(function () {
+    'use strict';
+    var pluginId = '467b751b-71c7-4e3d-a688-8ef46193d251';
+    var page = document.querySelector('#JellySeeNotificationsPage');
+    page.addEventListener('pageshow', function () {
+        Dashboard.showLoadingMsg();
+        ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+            page.querySelector('#Enabled').checked = config.Enabled;
+            page.querySelector('#Secret').value = '';
+            page.querySelector('#ClearSecret').checked = false;
+            page.querySelector('#Status').textContent = 'Status: ' + config.Status + '. Indexed: ' + config.IndexCount +
+                '. Outbox: ' + config.OutboxDepth + '. Baseline libraries remaining: ' + config.BaselineLibrariesRemaining +
+                (config.IndexFull ? '. Index full: addition recovery is off.' : '') + (config.TooManyUsers ? '. More than 2,000 users: sender paused.' : '');
+            Dashboard.hideLoadingMsg();
+        }).catch(function () { Dashboard.hideLoadingMsg(); Dashboard.alert('Could not load configuration.'); });
+    });
+    page.querySelector('#JellySeeNotificationsForm').addEventListener('submit', function (event) {
+        event.preventDefault(); Dashboard.showLoadingMsg();
+        ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+            config.Enabled = page.querySelector('#Enabled').checked;
+            var replacement = page.querySelector('#Secret').value;
+            if (page.querySelector('#ClearSecret').checked) config.Secret = '';
+            else if (replacement) config.Secret = replacement;
+            page.querySelector('#Secret').value = '';
+            return ApiClient.updatePluginConfiguration(pluginId, config);
+        }).then(Dashboard.processPluginConfigurationUpdateResult).catch(function () { Dashboard.hideLoadingMsg(); Dashboard.alert('Could not save configuration.'); });
+    });
+}());
+</script></div></body></html>
