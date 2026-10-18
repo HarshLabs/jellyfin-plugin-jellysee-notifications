@@ -12,7 +12,8 @@ public sealed class Journal : IDisposable
     public const int MaxRecord = 128 * 1024;
     public const long MaxFile = 192L * 1024 * 1024;
     private static readonly JsonSerializerOptions Json = new() { MaxDepth = 12, UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow, DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
-    private readonly StateDirectory files;
+    private StateDirectory files = null!;
+    private readonly StateIoWorker io;
     private FileStream? writer;
     private long operations;
     public State State { get; private set; } = new();
@@ -21,8 +22,8 @@ public sealed class Journal : IDisposable
     {
         get
         {
-            try { return files.Length("journal.ndjson") + files.Length("snapshot.bin"); }
-            catch (IOException ex) { throw new StatePersistenceException(ex); }
+            try { return io.Invoke(() => files.Length("journal.ndjson") + files.Length("snapshot.bin")); }
+            catch (IOException ex) when (ex is not StatePersistenceException) { throw new StatePersistenceException(ex); }
         }
     }
     private sealed record Entry(long Seq, Change[] Changes);
@@ -30,10 +31,20 @@ public sealed class Journal : IDisposable
     private sealed record Header(long Seq, int Format);
 
     public Journal(string directory, string? pluginDataPath = null)
+        : this(directory, pluginDataPath, CancellationToken.None, StateIoWorker.DefaultTimeout) { }
+
+    internal Journal(string directory, string? pluginDataPath, CancellationToken ct, TimeSpan timeout)
     {
-        files = new StateDirectory(directory, pluginDataPath ?? Path.GetDirectoryName(Path.GetFullPath(directory))!);
-        try { Load(); writer!.Seek(0, SeekOrigin.End); }
-        catch { writer?.Dispose(); files.Dispose(); throw; }
+        io = new StateIoWorker(ct, timeout, () => { writer?.Dispose(); files?.Dispose(); });
+        try
+        {
+            io.Invoke(() =>
+            {
+                files = new StateDirectory(directory, pluginDataPath ?? Path.GetDirectoryName(Path.GetFullPath(directory))!, io.Token);
+                Load(); writer!.Seek(0, SeekOrigin.End);
+            });
+        }
+        catch { io.Dispose(); throw; }
     }
     private static byte[] Encode<T>(T value)
     {
@@ -49,22 +60,30 @@ public sealed class Journal : IDisposable
         return JsonSerializer.Deserialize<T>(env.Payload, Json) ?? throw new InvalidDataException();
     }
     // ReadLine would allocate without a bound before detecting hostile input.
-    private static byte[]? Line(FileStream input)
+    private int ReadByte(FileStream input) { io.Token.ThrowIfCancellationRequested(); return input.ReadByte(); }
+    private byte[]? Line(FileStream input)
     {
         using var line = new MemoryStream();
         while (true)
         {
-            int b = input.ReadByte();
+            int b = ReadByte(input);
             if (b < 0) { if (line.Length != 0) throw new InvalidDataException("Truncated record"); return null; }
             if (b == '\n') return line.ToArray();
             if (line.Length >= MaxRecord) throw new InvalidDataException("Record cap");
             line.WriteByte((byte)b);
         }
     }
-    private static byte[] ReadExact(FileStream input, int size)
+    private byte[] ReadExact(FileStream input, int size)
     {
         byte[] bytes = new byte[size];
-        try { input.ReadExactly(bytes); } catch (EndOfStreamException) { throw new InvalidDataException("Truncated snapshot"); }
+        int position = 0;
+        while (position < size)
+        {
+            io.Token.ThrowIfCancellationRequested();
+            int read = input.Read(bytes.AsSpan(position));
+            if (read == 0) throw new InvalidDataException("Truncated snapshot");
+            position += read;
+        }
         return bytes;
     }
     private static void WriteLine(FileStream output, byte[] bytes) { output.Write(bytes); output.WriteByte((byte)'\n'); }
@@ -83,11 +102,11 @@ public sealed class Journal : IDisposable
                 using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
                 while (true)
                 {
-                    int kind = input.ReadByte();
+                    int kind = ReadByte(input);
                     if (kind == 4)
                     {
                         byte[] footer = ReadExact(input, 40);
-                        if (BinaryPrimitives.ReadInt64LittleEndian(footer.AsSpan(0, 8)) != count || !CryptographicOperations.FixedTimeEquals(footer.AsSpan(8), digest.GetHashAndReset()) || input.ReadByte() != -1)
+                        if (BinaryPrimitives.ReadInt64LittleEndian(footer.AsSpan(0, 8)) != count || !CryptographicOperations.FixedTimeEquals(footer.AsSpan(8), digest.GetHashAndReset()) || ReadByte(input) != -1)
                             throw new InvalidDataException("Snapshot footer");
                         break;
                     }
@@ -150,7 +169,7 @@ public sealed class Journal : IDisposable
     }
     public void Commit(params Change[] changes)
     {
-        try { CommitCore(changes); }
+        try { io.Invoke(() => CommitCore(changes)); }
         catch (Exception ex) when (ex is IOException and not StatePersistenceException or InvalidDataException or UnauthorizedAccessException) { throw new StatePersistenceException(ex); }
     }
     private void CommitCore(Change[] changes)
@@ -159,7 +178,7 @@ public sealed class Journal : IDisposable
         State.Transaction(changes, dryRun: true);
         long seq = checked(State.Seq + 1);
         byte[] bytes = Encode(new Entry(seq, changes));
-        if (writer!.Length + bytes.Length + 1 > MaxFile / 2) Compact();
+        if (writer!.Length + bytes.Length + 1 > MaxFile / 2) CompactCore();
         files.Verify("journal.ndjson", writer!);
         WriteLine(writer!, bytes); writer!.Flush(true);
         State.Transaction(changes);
@@ -168,7 +187,7 @@ public sealed class Journal : IDisposable
     public void MaybeCompact() { if (operations >= 4096) Compact(); }
     public void Compact()
     {
-        try { CompactCore(); }
+        try { io.Invoke(CompactCore); }
         catch (Exception ex) when (ex is IOException and not StatePersistenceException or InvalidDataException or UnauthorizedAccessException) { throw new StatePersistenceException(ex); }
     }
     private void CompactCore()
@@ -182,6 +201,7 @@ public sealed class Journal : IDisposable
             using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256); long count = 0;
             foreach (var c in State.Snapshot())
             {
+                io.Token.ThrowIfCancellationRequested();
                 byte kind = c.Kind == "title" ? (byte)1 : c.Kind == "remove" ? (byte)2 : c.Kind == "life" ? (byte)3 : (byte)0;
                 byte[] bytes = kind == 1 ? CompactCodec.Encode(c.Title!) : kind == 2 ? CompactCodec.Encode(c.Tombstone!) : kind == 3 ? CompactCodec.Encode(c.Lifecycle!) : Encode(new Entry(State.Seq, [c]));
                 output.WriteByte(kind); digest.AppendData([kind]);
@@ -206,7 +226,7 @@ public sealed class Journal : IDisposable
         var replacement = files.Rewrite("journal.ndjson", null, 0);
         writer!.Dispose(); writer = replacement; operations = 0;
     }
-    public void Dispose() { writer?.Dispose(); files.Dispose(); }
+    public void Dispose() => io.Dispose();
 }
 
 public sealed class StatePersistenceException(Exception inner) : IOException("Plugin state could not be written", inner);

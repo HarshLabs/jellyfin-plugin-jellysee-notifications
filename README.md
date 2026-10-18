@@ -50,8 +50,15 @@ files, and bounded startup recovery reclaims abandoned random temporary entries.
 Transient adapter/database failures retain the loop, subscriptions and
 scan progress, report `adapterUnavailable`, and retry with exponential delays
 from one to sixty seconds. Shutdown cancellation remains separate.
-Disk write failure stops the worker and reports `stateUnavailable` without
-printing exception text.
+State I/O runs on a dedicated background thread with a ten-second deadline per
+journal operation, including initialization, reads and size probes. The service
+yields before I/O so .NET 9 host startup can complete promptly. A stalled open or
+read (including a Unix FIFO), or a persistence failure, stops notification work
+and reports `stateUnavailable` on the dashboard. When configured, it attempts one
+bounded heartbeat with that code. It never retries the blocked path; shutdown
+cancels the caller's wait without joining the blocked background thread. Managed
+APIs cannot interrupt that thread's filesystem call; it can remain until process
+exit or the call returns. Exception text is never printed.
 
 An initial baseline indexes existing titles without announcing historical imports.
 It resumes from persisted discovery knowledge after a restart. Each library has

@@ -17,6 +17,9 @@ public sealed class NotificationService : BackgroundService
     private readonly RelayClient relay;
     private readonly ILogger<NotificationService> logger;
     private readonly Channel<Signal> channel;
+    private readonly Func<PluginConfiguration> configuration;
+    private readonly Func<(string Directory, string Root)> statePaths;
+    private readonly TimeSpan stateIoTimeout;
     private long channelDropped;
     private bool enabled;
     private string setupHash = "";
@@ -25,8 +28,16 @@ public sealed class NotificationService : BackgroundService
     private sealed record Signal(string Op, string Id, string? Type, string EventId, long At, string Setup, string? ParentId = null);
     private static long Now => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
     public NotificationService(ILibraryManager library, IJellyfinCompat compat, IServerApplicationHost host, RelayClient relay, ILogger<NotificationService> logger)
+        : this(library, compat, host, relay, logger,
+            () => (Plugin.Instance ?? throw new InvalidOperationException()).Configuration,
+            () => { var plugin = Plugin.Instance ?? throw new InvalidOperationException(); return (plugin.DataFolderPath, plugin.StateRootPath); },
+            StateIoWorker.DefaultTimeout) { }
+
+    internal NotificationService(ILibraryManager library, IJellyfinCompat compat, IServerApplicationHost host, RelayClient relay, ILogger<NotificationService> logger,
+        Func<PluginConfiguration> configuration, Func<(string Directory, string Root)> statePaths, TimeSpan stateIoTimeout)
     {
         this.library = library; this.compat = compat; this.host = host; this.relay = relay; this.logger = logger;
+        this.configuration = configuration; this.statePaths = statePaths; this.stateIoTimeout = stateIoTimeout;
         channel = Channel.CreateBounded<Signal>(new BoundedChannelOptions(State.Capacity) { SingleReader = true, FullMode = BoundedChannelFullMode.DropOldest }, _ => Interlocked.Increment(ref channelDropped));
     }
     private void Added(object? sender, ItemChangeEventArgs e)
@@ -55,14 +66,17 @@ public sealed class NotificationService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
-        // Only this method owns the journal and all mutable state.
+        await Task.Yield(); // .NET 9 StartAsync invokes ExecuteAsync synchronously.
+        // This service serializes transitions; the journal owns its I/O thread.
         try { await Run(ct); }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
         catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException))
         {
             // Exceptions may embed paths, item names or request headers: never log their text.
+            Volatile.Write(ref enabled, false);
+            SetError("stateUnavailable");
             logger.LogError("[JellySee Notifications] Background service stopped (stateUnavailable)");
-            if (Plugin.Instance is { } plugin) plugin.Configuration.Status = "stateUnavailable";
+            await ReportStateUnavailable(ct);
         }
         finally
         {
@@ -70,10 +84,25 @@ public sealed class NotificationService : BackgroundService
             library.ItemAdded -= Added; library.ItemRemoved -= Removed; library.ItemUpdated -= Updated;
         }
     }
+    private async Task ReportStateUnavailable(CancellationToken ct)
+    {
+        // The timed-out worker may still own/mutate its state. Never inspect it
+        // for health, retry the path, or wait for its cleanup on shutdown.
+        try
+        {
+            var config = configuration();
+            config.Status = "stateUnavailable";
+            if (config.Enabled && !string.IsNullOrWhiteSpace(config.Secret) && !ct.IsCancellationRequested)
+                await relay.Post(config.RelayOrigin, Identity.ServerKey(host.SystemId), config.Secret, "heartbeat",
+                    Heartbeat.Encode(host.SystemId, new State(), Now, "stateUnavailable", false, 0), [], ct);
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        { /* Keep the fixed dashboard failure even if the one-shot heartbeat fails. */ }
+    }
     private async Task Run(CancellationToken ct)
     {
-        var plugin = Plugin.Instance ?? throw new InvalidOperationException();
-        using var journal = new Journal(plugin.DataFolderPath, plugin.StateRootPath);
+        var paths = statePaths();
+        using var journal = new Journal(paths.Directory, paths.Root, ct, stateIoTimeout);
         string key = Identity.ServerKey(host.SystemId);
         var engine = new Engine(journal, compat, key);
         if (journal.RecoveredCorruption) SetError("stateRecovered");
@@ -89,7 +118,7 @@ public sealed class NotificationService : BackgroundService
         await IterationLoop.Run(async () =>
         {
             long now = Now;
-            var config = plugin.Configuration;
+            var config = configuration();
             bool configured = config.Enabled && !string.IsNullOrWhiteSpace(config.Secret);
             string stamp = Identity.Hash(config.Enabled + ":" + config.RelayOrigin + ":" + config.Secret);
             if (stamp != configStamp)
@@ -268,7 +297,7 @@ public sealed class NotificationService : BackgroundService
         }, code =>
         {
             if (code != "none" || error == "adapterUnavailable") SetError(code);
-            plugin.Configuration.Status = error;
+            configuration().Status = error;
         }, ct);
     }
     private static bool ReconcileInventory(Journal journal, Engine engine, InventoryResult poll, long now, string setup)
@@ -324,7 +353,7 @@ public static class Heartbeat
 {
     public static byte[] Encode(string server, State state, long now, string error, bool tooManyUsers, long bytes)
     {
-        string[] allowed = ["none", "relayUnreachable", "unauthorized", "tooManyUsers", "indexFull", "stateRecovered", "inventoryIncomplete", "itemEvaluationFailed", "reconcileFailed", "invalidConfiguration", "adapterUnavailable"];
+        string[] allowed = ["none", "relayUnreachable", "unauthorized", "tooManyUsers", "indexFull", "stateRecovered", "inventoryIncomplete", "itemEvaluationFailed", "reconcileFailed", "invalidConfiguration", "adapterUnavailable", "stateUnavailable"];
         if (!allowed.Contains(error)) throw new InvalidDataException("Invalid health code");
         if (tooManyUsers) error = "tooManyUsers"; else if (state.Health.IndexFull) error = "indexFull";
         using var output = new MemoryStream();

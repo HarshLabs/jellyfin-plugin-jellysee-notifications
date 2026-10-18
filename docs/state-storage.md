@@ -20,8 +20,9 @@ isolated fixture roots. The state directory must be strictly beneath that root.
   `FileMode.Create` or `FileMode.Truncate`.
 - Before an existing file is opened for reading, or the retained journal stream
   is used for append, `FileSystemInfo.LinkTarget` and `ReparsePoint` checks reject
-  symbolic links, dangling links and reparse points. Directories are rejected as
-  files. The named journal length must still match the writer before append.
+  symbolic links, dangling links and reparse points. Directory and Device
+  attributes are rejected as files. The named journal length must still match
+  the writer before append.
 - .NET 9/10 have no public managed file link-count API. Consequently hardlink
   counts cannot be inspected on these targets. Existing files are opened read
   only, then journal recovery copies the valid prefix into a fresh exclusively
@@ -41,6 +42,55 @@ hardlink creation cannot be ruled out. File flushing is explicit, but .NET does
 not provide a portable directory-fsync API: rename durability across power loss
 also depends on the host filesystem. Snapshot checksums, complete footers and
 journal replay still detect incomplete persisted records.
+
+## Bounded I/O and host startup
+
+`NotificationService.ExecuteAsync` starts with `await Task.Yield()` before any
+state/configuration path lookup or I/O. [.NET 9 BackgroundService.StartAsync](https://github.com/dotnet/runtime/blob/v9.0.0/src/libraries/Microsoft.Extensions.Hosting.Abstractions/src/BackgroundService.cs)
+calls ExecuteAsync directly and returns after it yields an incomplete task, so a
+blocked state open cannot hold Jellyfin 10.11 host startup. .NET 10 additionally
+dispatches ExecuteAsync in Task.Run. Minimal-host tests exercise both the installed
+.NET 10 implementation and the .NET 9 synchronous-start algorithm invoking the
+actual service ExecuteAsync; this is a simulation of .NET 9 hosting semantics,
+not an execution on a .NET 9 runtime.
+
+Every journal operation that accesses storage (initialization/recovery, commit,
+compaction and DiskBytes) is dispatched to one dedicated background thread.
+Each call has a ten-second deadline covering the whole operation, a stricter
+bound than a separate ten seconds for each open/read. The service's shutdown
+token also cancels the caller's wait. Journal handles, including their eventual
+disposal, stay on that thread. Timeouts permanently abandon the worker: subsequent
+calls fail immediately, the service disables callbacks, removes subscriptions
+and ends notification processing without retrying the path. The dashboard is set
+to the fixed `stateUnavailable` code even when notifications are disabled. When
+configured and not shutting down, the service attempts one ordinary ten-second
+heartbeat with that code, using empty state counters rather than accessing state
+still owned by the abandoned worker. A failed heartbeat does not overwrite the
+dashboard code and is not retried.
+
+Managed .NET APIs cannot reliably establish that a Unix entry is a regular file:
+a FIFO can have `FileAttributes.Normal` and no LinkTarget. Device/ReparsePoint/
+Directory checks reject identifiable special entries but are not a regular-file
+proof. File length and timestamps are not a proof either; a length query after
+open is too late to prevent a FIFO's blocking open. The timeout, rather than
+these heuristics, provides containment for both startup and later state reads.
+
+Cancellation cannot interrupt a synchronous managed filesystem open/read. An
+abandoned background thread can remain blocked until process exit or until the
+filesystem call returns. It is never joined on shutdown; cleanup runs on that
+thread if it returns. Cancellation checks prevent later path operations after
+abandonment, but an already active call may still finish, including a write.
+Normal disposal waits at most ten seconds for handles to close; cancellation
+releases that wait immediately. Slow regular-file operations exceeding the
+deadline also disable notifications and require a server restart after the
+storage problem is resolved. There is at most one abandoned I/O thread per
+service instance, with no automatic restart or retry loop.
+
+Unix FIFO regressions cover each active filename during construction and later
+DiskBytes probes, timeout health on the dashboard/heartbeat, prompt host startup,
+and shutdown cancellation before a much longer I/O deadline. FIFO cases are
+skipped on Windows. Portable worker tests verify dedicated background execution,
+terminal timeout/cancellation and detached cleanup after a blocked call returns.
 
 ## Temporary-file recovery
 

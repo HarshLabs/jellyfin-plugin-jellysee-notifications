@@ -8,12 +8,15 @@ internal sealed class StateDirectory : IDisposable
     private readonly string root;
     private readonly string resolvedRoot;
     private readonly string relative;
+    private readonly CancellationToken ct;
     private static StringComparison PathComparison => OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
     private static readonly string[] TempPrefixes = ["snapshot.tmp.", "journal.ndjson.tmp.", "snapshot.bin.corrupt.tmp."];
     internal const int RecoveryLimit = 128;
 
-    internal StateDirectory(string path, string pluginDataPath)
+    internal StateDirectory(string path, string pluginDataPath, CancellationToken ct = default)
     {
+        this.ct = ct;
+        ct.ThrowIfCancellationRequested();
         this.path = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
         root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(pluginDataPath));
         relative = Path.GetRelativePath(root, this.path);
@@ -46,6 +49,7 @@ internal sealed class StateDirectory : IDisposable
     private static bool IsLink(FileSystemInfo info) => info.LinkTarget is not null || (info.Attributes & FileAttributes.ReparsePoint) != 0;
     private void ValidateDirectory(bool create = false)
     {
+        ct.ThrowIfCancellationRequested();
         if (!string.Equals(ResolveDirectory(root), resolvedRoot, PathComparison)) throw new IOException("Plugin data path changed");
         string current = root;
         foreach (string part in relative.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
@@ -67,14 +71,14 @@ internal sealed class StateDirectory : IDisposable
         string boundary = Path.EndsInDirectorySeparator(resolvedRoot) ? resolvedRoot : resolvedRoot + Path.DirectorySeparatorChar;
         if (!resolved.StartsWith(boundary, PathComparison)) throw new IOException("State directory escaped plugin data path");
     }
-    private string CheckedPath(string name) { Name(name); ValidateDirectory(); return Path.Combine(path, name); }
+    private string CheckedPath(string name) { Name(name); ValidateDirectory(); ct.ThrowIfCancellationRequested(); return Path.Combine(path, name); }
     private FileInfo? Existing(string name)
     {
         var info = new FileInfo(CheckedPath(name)); info.Refresh();
         if (info.LinkTarget is not null) throw new IOException("Linked state file");
         try
         {
-            if ((File.GetAttributes(info.FullName) & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+            if ((File.GetAttributes(info.FullName) & (FileAttributes.Directory | FileAttributes.ReparsePoint | FileAttributes.Device)) != 0)
                 throw new IOException("Unsafe state file");
         }
         catch (FileNotFoundException) { return null; }
@@ -86,7 +90,11 @@ internal sealed class StateDirectory : IDisposable
         var info = Existing(name);
         // .NET 9/10 have no public link-count API. Existing hardlinks are read
         // only; Rewrite gives the journal a fresh exclusively-created file.
-        return info is null ? null : new FileStream(info.FullName, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
+        if (info is null) return null;
+        ct.ThrowIfCancellationRequested();
+        var stream = new FileStream(info.FullName, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
+        if (ct.IsCancellationRequested) { stream.Dispose(); ct.ThrowIfCancellationRequested(); }
+        return stream;
     }
     internal (string Name, FileStream Stream) Create(string prefix)
     {
@@ -96,6 +104,7 @@ internal sealed class StateDirectory : IDisposable
         var options = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.ReadWrite, Share = FileShare.Read | FileShare.Delete };
         if (!OperatingSystem.IsWindows()) options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
         // CreateNew fails for any existing entry, including dangling links.
+        ct.ThrowIfCancellationRequested();
         return (name, new FileStream(target, options));
     }
     internal void Verify(string name, FileStream stream)
@@ -121,8 +130,10 @@ internal sealed class StateDirectory : IDisposable
                 input.Position = 0; byte[] buffer = new byte[64 * 1024];
                 while (length > 0)
                 {
+                    ct.ThrowIfCancellationRequested();
                     int read = input.Read(buffer, 0, (int)Math.Min(length, buffer.Length));
                     if (read == 0) throw new IOException("State source truncated");
+                    ct.ThrowIfCancellationRequested();
                     temp.Stream.Write(buffer, 0, read); length -= read;
                 }
             }
