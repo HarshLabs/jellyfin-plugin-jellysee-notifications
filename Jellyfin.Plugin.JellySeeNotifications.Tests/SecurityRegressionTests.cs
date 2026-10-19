@@ -75,6 +75,11 @@ public sealed class SecurityRegressionTests
     [Fact] public void DirectoryReplacementCannotRedirectLaterWrites()
     {
         using var temp = new TempDirectory(); using var outside = new TempDirectory();
+        if (OperatingSystem.IsWindows())
+        {
+            AssertWindowsRefusesDirectorySubstitution(temp.Path, temp.Path, Path.GetDirectoryName(temp.Path)!, outside.Path);
+            return;
+        }
         string moved = temp.Path + ".held";
         try
         {
@@ -127,6 +132,11 @@ public sealed class SecurityRegressionTests
     [Fact] public void TrustedRootSubstitutionStopsFurtherWrites()
     {
         using var root = new TempDirectory(); using var outside = new TempDirectory();
+        if (OperatingSystem.IsWindows())
+        {
+            AssertWindowsRefusesDirectorySubstitution(root.Path, Path.Combine(root.Path, "state"), root.Path, outside.Path);
+            return;
+        }
         string moved = root.Path + ".held";
         try
         {
@@ -139,6 +149,39 @@ public sealed class SecurityRegressionTests
             }
         }
         finally { Directory.Delete(root.Path); Directory.Move(moved, root.Path); }
+    }
+    private static void AssertWindowsRefusesDirectorySubstitution(string directory, string statePath, string rootPath, string outside)
+    {
+        string moved = directory + ".held";
+        try
+        {
+            using (var journal = new Journal(statePath, rootPath))
+            {
+                // Windows refuses the rename while the journal's child handle
+                // is live. The substitution cannot reach symlink installation.
+                var failure = Record.Exception(() => Directory.Move(directory, moved));
+                Assert.True(failure is IOException or UnauthorizedAccessException,
+                    "Expected Windows to refuse renaming the directory with a live journal");
+                Assert.True(Directory.Exists(directory)); Assert.False(Directory.Exists(moved));
+                Assert.Null(new DirectoryInfo(directory).LinkTarget);
+                journal.Commit(new Change { Kind = "notice", Notice = Event() });
+                journal.Compact();
+                Assert.Single(journal.State.Notices);
+                Assert.True(File.Exists(Path.Combine(statePath, "snapshot.bin")));
+                Assert.Empty(Directory.EnumerateFileSystemEntries(outside));
+            }
+            using (var recovered = new Journal(statePath, rootPath)) Assert.Single(recovered.State.Notices);
+            // Prove the refusal was tied to the live handles: the same rename
+            // is legal after disposal, rather than failing due to fixture setup.
+            Directory.Move(directory, moved);
+            Directory.Move(moved, directory);
+        }
+        finally
+        {
+            // Restore only a rename that actually happened. In particular, do
+            // not delete the populated original directory if rename was refused.
+            if (Directory.Exists(moved) && !Directory.Exists(directory)) Directory.Move(moved, directory);
+        }
     }
     [Fact] public void FailedCompactionRemovesItsTemporarySnapshot()
     {
