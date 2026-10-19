@@ -7,7 +7,15 @@ permissions:
   contents: read
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-13 was retired; macos-15-intel preserves x64 coverage.
+        os: [windows-latest, windows-11-arm, ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -17,7 +25,10 @@ jobs:
           dotnet-version: |
             9.0.x
             10.0.x
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.13'
       - run: dotnet restore --locked-mode
       - run: dotnet build -c Release --no-restore
       - run: dotnet test -c Release --no-build --no-restore
-      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - run: python -m unittest discover -s scripts -p 'test_*.py'

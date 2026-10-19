@@ -4,7 +4,7 @@
     <Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>Jellyfin.Plugin.JellySeeNotifications</RootNamespace>
     <AssemblyName>Jellyfin.Plugin.JellySeeNotifications</AssemblyName>
-    <ReleaseVersion>1.0.0.0</ReleaseVersion><Version>$(ReleaseVersion)</Version>
+    <ReleaseVersion>1.0.1.0</ReleaseVersion><Version>$(ReleaseVersion)</Version>
     <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
     <Deterministic>true</Deterministic><DebugType>embedded</DebugType>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>

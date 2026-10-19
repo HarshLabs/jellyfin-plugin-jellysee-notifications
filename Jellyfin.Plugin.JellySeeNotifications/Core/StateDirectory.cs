@@ -118,9 +118,17 @@ internal sealed class StateDirectory : IDisposable
         Verify(name, stream);
         // Move overwrites the destination entry itself, including a link; it
         // never opens/truncates the destination or writes through its links.
-        File.Move(CheckedPath(name), CheckedPath(target), overwrite: true);
+        string sourcePath = CheckedPath(name), targetPath = CheckedPath(target);
+        try { File.Move(sourcePath, targetPath, overwrite: true); }
+        catch (UnauthorizedAccessException ex) when (OperatingSystem.IsWindows())
+        {
+            // MoveFileEx can report ACCESS_DENIED for a transient open
+            // destination even with Delete sharing (dotnet/runtime#114230).
+            // Mark only this operation; ordinary permission failures stay fatal.
+            throw new StateReplacementException(ex);
+        }
     }
-    internal FileStream Rewrite(string target, FileStream? input, long length)
+    internal FileStream Rewrite(string target, FileStream? input, long length, bool closeInput = false)
     {
         var temp = Create(target + ".tmp");
         try
@@ -137,6 +145,10 @@ internal sealed class StateDirectory : IDisposable
                     temp.Stream.Write(buffer, 0, read); length -= read;
                 }
             }
+            // A restart's source is the destination entry. Close it after the
+            // bounded copy, before overwrite: Delete sharing alone is not enough
+            // for MoveFileEx on Windows. Never delete the durable target first.
+            if (closeInput) input?.Dispose();
             Replace(temp.Name, temp.Stream, target); return temp.Stream;
         }
         catch { temp.Stream.Dispose(); Discard(temp.Name); throw; }
@@ -169,6 +181,9 @@ internal sealed class StateDirectory : IDisposable
             }
         }
     }
-    internal long Length(string name) { using var input = Read(name); return input?.Length ?? 0; }
+    // Use refreshed metadata after the same containment/link checks as Read.
+    // Opening a Read|Delete reader would deny the live writer's write access
+    // on Windows. Do not broaden sharing to allow another writer instead.
+    internal long Length(string name) => Existing(name)?.Length ?? 0;
     public void Dispose() { }
 }

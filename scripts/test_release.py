@@ -3,11 +3,16 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import sys
+import xml.etree.ElementTree as ET
 import tempfile
 import unittest
 import zipfile
+from release_version import artifact_version
 
 ROOT = Path(__file__).resolve().parents[1]
+VERSION = ET.parse(ROOT / "Jellyfin.Plugin.JellySeeNotifications/Jellyfin.Plugin.JellySeeNotifications.csproj").findtext(".//ReleaseVersion")
+VERSION12 = artifact_version(VERSION, "12.0.0.0")
 
 
 class ReleaseTests(unittest.TestCase):
@@ -18,24 +23,24 @@ class ReleaseTests(unittest.TestCase):
             work = Path(work)
             notes = work / 'notes.txt'
             notes.write_text('Initial offline package verification.\n')
-            subprocess.run(['python3', 'scripts/package.py', '--version', '1.0.0.0', '--notes', str(notes)], cwd=ROOT, check=True)
+            subprocess.run([sys.executable, 'scripts/package.py', '--version', VERSION, '--notes', str(notes)], cwd=ROOT, check=True)
             manifest = work / 'manifest.json'
             manifest.write_bytes((ROOT / 'manifest.json').read_bytes())
-            args = ['python3', 'scripts/update-manifest.py', '--manifest', str(manifest), '--version', '1.0.0.0', '--changelog-file', str(notes)]
+            args = [sys.executable, 'scripts/update-manifest.py', '--manifest', str(manifest), '--version', VERSION, '--changelog-file', str(notes)]
             for suffix, abi in [('jf10.11', '10.11.0.0'), ('jf12', '12.0.0.0')]:
-                archive = ROOT / 'dist' / f'jellysee-notifications_1.0.0.0_{suffix}.zip'
+                archive = ROOT / 'dist' / f'jellysee-notifications_{VERSION}_{suffix}.zip'
                 with zipfile.ZipFile(archive) as package:
                     self.assertEqual(set(package.namelist()), {'Jellyfin.Plugin.JellySeeNotifications.dll', 'meta.json', 'LICENSE'})
                     meta = json.loads(package.read('meta.json'))
                     self.assertEqual(meta['targetAbi'], abi)
-                    self.assertEqual(meta['version'], '1.0.0.1' if suffix == 'jf12' else '1.0.0.0')
+                    self.assertEqual(meta['version'], VERSION12 if suffix == 'jf12' else VERSION)
                     self.assertEqual(meta['guid'], '467b751b-71c7-4e3d-a688-8ef46193d251')
                 args += ['--entry', f'{archive}={abi}=https://example.invalid/{archive.name}']
             for _ in range(2):
                 subprocess.run(args, cwd=ROOT, check=True, capture_output=True)
             versions = json.loads(manifest.read_text())[0]['versions']
             self.assertEqual([v['targetAbi'] for v in versions[:2]], ['12.0.0.0', '10.11.0.0'])
-            self.assertEqual([v['version'] for v in versions], ['1.0.0.1', '1.0.0.0'])
+            self.assertEqual([v['version'] for v in versions[:2]], [VERSION12, VERSION])
             self.verify_server_upgrade(versions)
             for line in (ROOT / 'dist/SHA256SUMS.txt').read_text().splitlines():
                 digest, name = line.split('  ')
@@ -54,11 +59,13 @@ class ReleaseTests(unittest.TestCase):
                                 key=lambda v: number(v['version']), reverse=True)
             return next((v for v in compatible if number(v['version']) > number(installed)), None)
 
-        self.assertIsNone(update('10.11.8.0', '1.0.0.0'))
+        self.assertEqual(update('10.11.8.0', '1.0.0.0')['version'], VERSION)
+        self.assertIsNone(update('10.11.8.0', VERSION))
         migrated = update('12.0.0.0', '1.0.0.0')
         self.assertEqual(migrated['targetAbi'], '12.0.0.0')
-        self.assertEqual(migrated['version'], '1.0.0.1')
-        self.assertIsNone(update('12.0.0.0', '1.0.0.1'))
+        self.assertEqual(migrated['version'], VERSION12)
+        self.assertEqual(update('12.0.0.0', '1.0.0.1')['version'], VERSION12)
+        self.assertIsNone(update('12.0.0.0', VERSION12))
         for server, abi in [('10.11.8.0', '10.11.0.0'), ('12.0.0.0', '12.0.0.0')]:
             self.assertEqual(update(server, '0.9.0.1')['targetAbi'], abi)
 

@@ -20,6 +20,7 @@ public sealed class NotificationService : BackgroundService
     private readonly Func<PluginConfiguration> configuration;
     private readonly Func<(string Directory, string Root)> statePaths;
     private readonly TimeSpan stateIoTimeout;
+    private readonly Func<TimeSpan, CancellationToken, Task> stateRetryDelay;
     private long channelDropped;
     private bool enabled;
     private string setupHash = "";
@@ -34,10 +35,12 @@ public sealed class NotificationService : BackgroundService
             StateIoWorker.DefaultTimeout) { }
 
     internal NotificationService(ILibraryManager library, IJellyfinCompat compat, IServerApplicationHost host, RelayClient relay, ILogger<NotificationService> logger,
-        Func<PluginConfiguration> configuration, Func<(string Directory, string Root)> statePaths, TimeSpan stateIoTimeout)
+        Func<PluginConfiguration> configuration, Func<(string Directory, string Root)> statePaths, TimeSpan stateIoTimeout,
+        Func<TimeSpan, CancellationToken, Task>? stateRetryDelay = null)
     {
         this.library = library; this.compat = compat; this.host = host; this.relay = relay; this.logger = logger;
         this.configuration = configuration; this.statePaths = statePaths; this.stateIoTimeout = stateIoTimeout;
+        this.stateRetryDelay = stateRetryDelay ?? Task.Delay;
         channel = Channel.CreateBounded<Signal>(new BoundedChannelOptions(State.Capacity) { SingleReader = true, FullMode = BoundedChannelFullMode.DropOldest }, _ => Interlocked.Increment(ref channelDropped));
     }
     private void Added(object? sender, ItemChangeEventArgs e)
@@ -67,27 +70,38 @@ public sealed class NotificationService : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
         await Task.Yield(); // .NET 9 StartAsync invokes ExecuteAsync synchronously.
-        // This service serializes transitions; the journal owns its I/O thread.
-        try { await Run(ct); }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
-        catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException))
+        // Reopen/replay after a completed sharing failure: a failed append or
+        // fsync may already be durable, so never blindly repeat a transaction.
+        int failures = 0;
+        while (!ct.IsCancellationRequested)
         {
-            // Exceptions may embed paths, item names or request headers: never log their text.
-            Volatile.Write(ref enabled, false);
-            SetError("stateUnavailable");
-            logger.LogError("[JellySee Notifications] Background service stopped (stateUnavailable)");
-            await ReportStateUnavailable(ct);
-        }
-        finally
-        {
-            Volatile.Write(ref enabled, false);
-            library.ItemAdded -= Added; library.ItemRemoved -= Removed; library.ItemUpdated -= Updated;
+            try { await Run(ct); return; }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+            catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException))
+            {
+                Volatile.Write(ref enabled, false);
+                SetError("stateUnavailable");
+                var cause = StateFailure.Cause(ex);
+                // Never pass the exception itself, its message, paths or IDs.
+                logger.LogError("[JellySee Notifications] State unavailable (stateUnavailable); exceptionType={ExceptionType}; hResult={HResult:X8}",
+                    cause.GetType().FullName, cause.HResult);
+                await ReportStateUnavailable(ct);
+                if (!StateFailure.IsSharing(ex)) return;
+            }
+            finally
+            {
+                Volatile.Write(ref enabled, false);
+                library.ItemAdded -= Added; library.ItemRemoved -= Removed; library.ItemUpdated -= Updated;
+            }
+            failures = Math.Min(failures + 1, 7);
+            try { await stateRetryDelay(TimeSpan.FromSeconds(Math.Min(60, 1 << (failures - 1))), ct); }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
         }
     }
     private async Task ReportStateUnavailable(CancellationToken ct)
     {
-        // The timed-out worker may still own/mutate its state. Never inspect it
-        // for health, retry the path, or wait for its cleanup on shutdown.
+        // A timed-out worker may still own/mutate its state. Health must never
+        // inspect it or retry its path; only completed workers can be reopened.
         try
         {
             var config = configuration();
@@ -103,6 +117,17 @@ public sealed class NotificationService : BackgroundService
     {
         var paths = statePaths();
         using var journal = new Journal(paths.Directory, paths.Root, ct, stateIoTimeout);
+        try { await RunJournal(journal, ct); }
+        catch (Exception ex) when (StateFailure.IsSharing(ex))
+        {
+            journal.Dispose();
+            if (!journal.CanRestart) throw new StatePersistenceException(new TimeoutException());
+            throw;
+        }
+    }
+    private async Task RunJournal(Journal journal, CancellationToken ct)
+    {
+        if (error == "stateUnavailable") SetError("none");
         string key = Identity.ServerKey(host.SystemId);
         var engine = new Engine(journal, compat, key);
         if (journal.RecoveredCorruption) SetError("stateRecovered");
@@ -359,7 +384,7 @@ public static class Heartbeat
         using var output = new MemoryStream();
         using (var w = new Utf8JsonWriter(output))
         {
-            w.WriteStartObject(); w.WriteNumber("v", 2); w.WriteString("server", server); w.WriteString("version", "1.0.0");
+            w.WriteStartObject(); w.WriteNumber("v", 2); w.WriteString("server", server); w.WriteString("version", "1.0.1");
             w.WriteNumber("outboxDepth", state.Notices.Values.Count(n => n.Stage == "outbox"));
             w.WriteNumber("oldestPendingAgeS", state.Notices.Count == 0 ? 0 : Math.Max(0, now - state.Notices.Values.Min(n => n.QueuedAt)));
             w.WriteNumber("droppedSinceLast", state.Health.Dropped);

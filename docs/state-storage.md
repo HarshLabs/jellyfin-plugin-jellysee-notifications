@@ -84,11 +84,53 @@ Normal disposal waits at most ten seconds for handles to close; cancellation
 releases that wait immediately. Slow regular-file operations exceeding the
 deadline also disable notifications and require a server restart after the
 storage problem is resolved. There is at most one abandoned I/O thread per
-service instance, with no automatic restart or retry loop.
+service instance; abandoned workers are never automatically restarted.
 
-Unix FIFO regressions cover each active filename during construction and later
-DiskBytes probes, timeout health on the dashboard/heartbeat, prompt host startup,
-and shutdown cancellation before a much longer I/O deadline. FIFO cases are
+`DiskBytes` now uses refreshed `FileInfo.Length` metadata through the existing
+containment/link checks, with no reader open. A FIFO size probe consequently
+returns metadata without waiting for a peer. This does not establish regular-file
+identity; actual startup/replay reads remain protected by the same deadline.
+
+Completed I/O failures with Windows sharing/lock HResults `80070020` and
+`80070021` are retryable. Windows overwrite-move failures with `80070005`
+(access denied) are also marked retryable at that operation only: MoveFileEx
+can report this for a transient destination lock despite Delete sharing
+([dotnet/runtime#114230](https://github.com/dotnet/runtime/issues/114230)).
+An actual permission problem at that move will likewise keep retrying until
+resolved or shutdown. Access denial outside overwrite-move remains terminal. After normal disposal confirms
+the old worker finished all cleanup, the service reopens/replays on a new worker.
+It never retries an append transaction in place: an error during write/flush may
+have left a durable full or partial record. Replay validates and repairs that
+prefix before resuming. Retry delays increase from one to sixty seconds and
+remain cancellable, with callbacks disabled and subscriptions removed between
+attempts. The bounded callback channel survives retries; callbacks missed while
+disabled use startup reconciliation as their catch-up path. Other I/O failures,
+failed/stalled cleanup and timeouts stay terminal. Each failed attempt sets the
+dashboard health and attempts the existing bounded heartbeat when configured.
+Logs include a fixed message plus the underlying exception type and HResult,
+without exception objects, messages, paths or IDs.
+
+All readers use `FileAccess.Read` and `FileShare.Read | FileShare.Delete`;
+new writers retain `ReadWrite` access and `Read | Delete` sharing. No plugin path
+opens a reader while a writer to that same file is live. Windows sharing is
+bidirectional: such a reader would deny the existing writer's write access.
+Metadata probes avoid that conflict without permitting external writers. During
+startup rewrite, the old read-only journal is closed after its bounded copy
+and before replacement; during compaction, the old writer is closed after
+snapshot publication and before journal replacement. Snapshot readers are closed
+before deletion during quarantine; no owned handle to an old snapshot or
+quarantine destination survives into its overwrite. This avoids relying on
+MoveFileEx overwrite of an open destination. Newly created source handles stay
+open with Delete sharing during rename, and the replacement journal retains
+that exclusively created handle for appends. There is no delete-then-move gap
+for any replacement. External destination handles can still cause a recoverable
+sharing/move error. Unix rename/unlink permits open handles too; the same close
+ordering is used on all platforms. See [FileShare](https://learn.microsoft.com/en-us/dotnet/api/system.io.fileshare)
+and [CreateFile sharing rules](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew).
+
+Unix FIFO regressions cover each active filename during construction, metadata
+size probes without an open, timeout health on the dashboard/heartbeat, prompt
+host startup, and shutdown cancellation before a much longer I/O deadline. FIFO cases are
 skipped on Windows. Portable worker tests verify dedicated background execution,
 terminal timeout/cancellation and detached cleanup after a blocked call returns.
 
@@ -134,6 +176,7 @@ The data directory must retain Jellyfin's administrator-only permissions.
 Regression tests exercise fixed-name links (including dangling links), hardlinks,
 quarantine destinations, state-directory/ancestor/root substitution, failed copy
 and replacement cleanup, and bounded crash-temporary recovery. They run on macOS
-ARM64 here. Compilation of both frameworks is not runtime verification on Linux,
-Intel macOS or Windows; filesystem execution on those platforms remains a release
-validation step.
+ARM64 here. Both CI and release validation now run the full test suite on
+Windows x64/arm64, Linux x64/arm64 and macOS arm64/x64. This local execution does
+not establish results for other runners. The matrix builds both frameworks and
+executes tests on .NET 10, including the simulated .NET 9 startup algorithm.

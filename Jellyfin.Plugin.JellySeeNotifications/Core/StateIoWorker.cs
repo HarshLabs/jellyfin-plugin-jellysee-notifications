@@ -15,6 +15,8 @@ internal sealed class StateIoWorker : IDisposable
     private readonly TimeSpan timeout;
     private int abandoned;
     private int disposed;
+    private int cleanupSucceeded;
+    internal bool CanRestart => Volatile.Read(ref abandoned) == 0 && stopped.Task.IsCompleted && Volatile.Read(ref cleanupSucceeded) != 0;
     internal CancellationToken Token => token;
 
     internal StateIoWorker(CancellationToken ct, TimeSpan timeout, Action cleanup)
@@ -31,7 +33,7 @@ internal sealed class StateIoWorker : IDisposable
             }
             finally
             {
-                try { cleanup(); }
+                try { cleanup(); Volatile.Write(ref cleanupSucceeded, 1); }
                 catch (Exception) { /* No exception text or unhandled background-thread failure. */ }
                 // CompleteAdding and resource disposal must not race.
                 lock (stopGate) { lifetime.Dispose(); work.Dispose(); }

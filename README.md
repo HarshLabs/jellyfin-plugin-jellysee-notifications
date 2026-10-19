@@ -1,12 +1,13 @@
 # JellySee Notifications
 
-Jellyfin plugin release 1.0.0.0 for audience-scoped library notifications in JellySee.
+Jellyfin plugin release 1.0.1.0 for audience-scoped library notifications in JellySee.
 Separate binaries support Jellyfin **10.11** (.NET 9, Controller/Model 10.11.8)
 and **12** (.NET 10, Controller/Model 12.0.0-rc3). The 10.11 DLL/package version is
-**1.0.0.0**; the 12 DLL/package version is **1.0.0.1**, so upgrading the server
+**1.0.1.0**; the 12 DLL/package version is **1.0.1.1**, so upgrading the server
 also offers a strictly newer compatible plugin. Jellyfin 10.10 is unsupported.
-The repository starts with an empty release-version list; nothing here has been
-published or deployed.
+Version 1.0.1 fixes Windows state-file sharing during size probes and adds
+sharing-error recovery and validation across all six OS/architecture combinations.
+See [the changelog](CHANGELOG.md).
 
 ## Configuration
 
@@ -58,7 +59,17 @@ and reports `stateUnavailable` on the dashboard. When configured, it attempts on
 bounded heartbeat with that code. It never retries the blocked path; shutdown
 cancels the caller's wait without joining the blocked background thread. Managed
 APIs cannot interrupt that thread's filesystem call; it can remain until process
-exit or the call returns. Exception text is never printed.
+exit or the call returns. Completed Windows sharing/lock violations (HResults
+`80070020`/`80070021`, plus access denial specifically during an overwrite-move)
+instead close the worker, reopen and replay durable state,
+and retry with delays from one to sixty seconds until access recovers or shutdown.
+A worker whose cleanup fails or stalls cannot be reopened. Size probes use checked
+file metadata without opening a reader against the live journal writer.
+Startup replay closes its source reader before replacing the journal; compaction
+closes the old writer after snapshot publication and before journal replacement.
+This avoids Windows overwrite-moves onto owned open destinations.
+`stateUnavailable` logs contain only a fixed message, exception type and HResult;
+exception text, paths and IDs are never printed.
 
 An initial baseline indexes existing titles without announcing historical imports.
 It resumes from persisted discovery knowledge after a restart. Each library has
@@ -173,7 +184,7 @@ relay is needed. Tests use fake transports and library adapters; no HTTP is sent
 To prepare archives after a Release build:
 
 ```sh
-python3 scripts/package.py --version 1.0.0.0 --notes path/to/release-notes.txt
+python3 scripts/package.py --version 1.0.1.0 --notes path/to/release-notes.txt
 ```
 
 The package contains the plugin DLL, `meta.json` and license; it excludes Jellyfin
@@ -196,5 +207,14 @@ cannot be configured in this local-only checkout. Run the plan's real-server
 2,000-deletion ≤5% performance gate, and an independent security review before
 publishing. Those integration and performance gates were not exercised here. The security
 regressions ran on macOS arm64 using managed storage; Linux x64/ARM64, macOS x64
-and Windows execution still require those platforms. Both target frameworks
-compile here, without native storage imports or architecture-specific layouts.
+and Windows execution are configured in both CI and the release validation job.
+The matrix is `windows-latest` (x64), `windows-11-arm`, `ubuntu-latest` (x64),
+`ubuntu-24.04-arm`, `macos-latest` (arm64) and `macos-15-intel` (x64).
+Each runs both-framework builds, the full .NET 10 test suite, and Python packaging
+tests. GitHub [retired macos-13](https://github.blog/changelog/2025-09-19-github-actions-macos-13-runner-image-is-closing-down/)
+on December 4, 2025; `macos-15-intel` supplies the requested Intel coverage.
+[Windows and Linux arm64 runners are available](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
+for public and private repositories. Publishing remains a single Ubuntu job in
+the `release` environment and waits for validation. No matrix jobs ran locally;
+the local run covers macOS arm64. Both target frameworks compile here without
+native storage imports or architecture-specific layouts.

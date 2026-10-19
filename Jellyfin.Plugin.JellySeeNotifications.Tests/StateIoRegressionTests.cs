@@ -50,19 +50,17 @@ public sealed class StateIoRegressionTests
     [UnixTheory]
     [InlineData("snapshot.bin")]
     [InlineData("journal.ndjson")]
-    public async Task LaterSizeProbeIsBoundedAndDisposalDoesNotWaitForBlockedOpen(string name)
+    public async Task LaterSizeProbeUsesMetadataWithoutOpeningFifoOrAbandoningWorker(string name)
     {
         using var temp = new TempDirectory();
-        using var journal = new Journal(temp.Path, Path.GetDirectoryName(temp.Path)!, default, IoTimeout);
+        using var journal = new Journal(temp.Path, Path.GetDirectoryName(temp.Path)!, default, TimeSpan.FromSeconds(3));
         string path = Path.Combine(temp.Path, name); File.Delete(path);
         using var fifo = new Fifo(path);
-        var failure = await Assert.ThrowsAsync<StatePersistenceException>(() => Task.Run(() => journal.DiskBytes).WaitAsync(TimeSpan.FromSeconds(3)));
-        Assert.IsType<TimeoutException>(failure.InnerException);
+        Assert.Equal(0, await Task.Run(() => journal.DiskBytes).WaitAsync(TimeSpan.FromSeconds(3)));
+        Assert.Equal(0, journal.DiskBytes); // worker is still usable
         var timer = Stopwatch.StartNew();
-        Assert.Throws<StatePersistenceException>(() => journal.DiskBytes); // abandoned worker is terminal
-        Assert.Throws<StatePersistenceException>(() => journal.Commit(new Change { Kind = "health", Health = new() }));
         journal.Dispose();
-        Assert.True(timer.Elapsed < TimeSpan.FromMilliseconds(250));
+        Assert.True(timer.Elapsed < TimeSpan.FromSeconds(3));
     }
 
     [Theory]
@@ -104,6 +102,7 @@ public sealed class StateIoRegressionTests
         var config = new PluginConfiguration { Enabled = true, Secret = "fixture-secret" };
         int subscriptions = 0, additions = 0, requests = 0, pathCalls = 0;
         string? health = null;
+        var probeCompleted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var library = Proxy<ILibraryManager>((method, _) =>
         {
             if (method.Name.StartsWith("add_"))
@@ -132,7 +131,7 @@ public sealed class StateIoRegressionTests
         // Disable notifications after initialization for the later-open fixture,
         // so the iteration reaches DiskBytes without any adapter queries.
         var service = new NotificationService(library, compat, server, relay, NullLogger<NotificationService>.Instance,
-            () => config, () => { pathCalls++; return (temp.Path, Path.GetDirectoryName(temp.Path)!); }, TimeSpan.FromSeconds(2));
+            () => { if (config.Status == "notConfigured") probeCompleted.TrySetResult(); return config; }, () => { pathCalls++; return (temp.Path, Path.GetDirectoryName(temp.Path)!); }, TimeSpan.FromSeconds(2));
         Assert.Equal(0, pathCalls); // construction has no state I/O
         var net9 = new Net9StartAdapter(service);
         using var host = new HostBuilder().ConfigureServices(services =>
@@ -144,6 +143,17 @@ public sealed class StateIoRegressionTests
             await Task.Run(() => host.StartAsync()).WaitAsync(TimeSpan.FromSeconds(1));
             Assert.True(timer.Elapsed < TimeSpan.FromSeconds(1));
             var execution = net9Start ? net9.Execution! : service.ExecuteTask!;
+            if (afterStartup)
+            {
+                await probeCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                Assert.False(execution.IsCompleted);
+                Assert.Equal("notConfigured", config.Status);
+                Assert.Equal(0, requests); Assert.Equal(3, additions);
+                Assert.Equal(1, pathCalls);
+                await host.StopAsync().WaitAsync(TimeSpan.FromSeconds(1));
+                Assert.Equal(0, subscriptions);
+                return;
+            }
             await execution.WaitAsync(TimeSpan.FromSeconds(5));
             Assert.Equal("stateUnavailable", config.Status);
             if (!afterStartup) { Assert.Equal("stateUnavailable", health); Assert.Equal(1, requests); Assert.Equal(0, additions); }

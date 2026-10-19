@@ -23,7 +23,7 @@ public sealed class Journal : IDisposable
         get
         {
             try { return io.Invoke(() => files.Length("journal.ndjson") + files.Length("snapshot.bin")); }
-            catch (IOException ex) when (ex is not StatePersistenceException) { throw new StatePersistenceException(ex); }
+            catch (Exception ex) when (ex is IOException and not StatePersistenceException or UnauthorizedAccessException) { throw new StatePersistenceException(ex); }
         }
     }
     private sealed record Entry(long Seq, Change[] Changes);
@@ -44,7 +44,14 @@ public sealed class Journal : IDisposable
                 Load(); writer!.Seek(0, SeekOrigin.End);
             });
         }
-        catch { io.Dispose(); throw; }
+        catch (Exception ex)
+        {
+            io.Dispose();
+            // A new worker is safe only once the old worker closed every handle.
+            if (StateFailure.IsSharing(ex) && !io.CanRestart)
+                throw new StatePersistenceException(new TimeoutException());
+            throw;
+        }
     }
     private static byte[] Encode<T>(T value)
     {
@@ -136,6 +143,7 @@ public sealed class Journal : IDisposable
                 // Copy through a new exclusive file; never open/truncate an existing
                 // quarantine destination, including an attacker-installed link.
                 using var quarantine = files.Rewrite("snapshot.bin.corrupt", snapshot, Math.Min(snapshot.Length, MaxFile));
+                snapshot.Dispose();
                 files.Remove("snapshot.bin");
                 RecoveredCorruption = true;
             }
@@ -165,7 +173,7 @@ public sealed class Journal : IDisposable
         { RecoveredCorruption = true; }
         // Recovery and future appends use a fresh exclusive inode. Existing hard
         // links cannot turn a replay-tail repair into an outside-file truncation.
-        writer = files.Rewrite("journal.ndjson", log, good);
+        writer = files.Rewrite("journal.ndjson", log, good, closeInput: true);
     }
     public void Commit(params Change[] changes)
     {
@@ -223,9 +231,13 @@ public sealed class Journal : IDisposable
             temp.Stream.Dispose();
             files.Discard(temp.Name);
         }
-        var replacement = files.Rewrite("journal.ndjson", null, 0);
-        writer!.Dispose(); writer = replacement; operations = 0;
+        // MoveFileEx overwrite may reject an open destination despite Delete
+        // sharing. The flushed snapshot is already durable before closing the
+        // old journal; failure now is recovered by replay on a fresh worker.
+        writer!.Dispose();
+        writer = files.Rewrite("journal.ndjson", null, 0); operations = 0;
     }
+    internal bool CanRestart => io.CanRestart;
     public void Dispose() => io.Dispose();
 }
 

@@ -63,7 +63,8 @@ public sealed class StateTests
         string journalPath = System.IO.Path.Combine(temp.Path, "journal.ndjson"); byte[] before;
         using (var journal = new Journal(temp.Path))
         {
-            journal.Commit(new Change { Kind = "notice", Notice = Event() }); before = File.ReadAllBytes(journalPath);
+            journal.Commit(new Change { Kind = "notice", Notice = Event() }); using (var input = new FileStream(journalPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (var copy = new MemoryStream()) { input.CopyTo(copy); before = copy.ToArray(); }
             journal.Compact();
         }
         // Crash after snapshot rename, before log truncation.
