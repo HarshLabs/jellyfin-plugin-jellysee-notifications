@@ -47,6 +47,7 @@ public sealed class Journal : IDisposable
         catch (Exception ex)
         {
             io.Dispose();
+            ct.ThrowIfCancellationRequested();
             // A new worker is safe only once the old worker closed every handle.
             if (StateFailure.IsSharing(ex) && !io.CanRestart)
                 throw new StatePersistenceException(new TimeoutException());

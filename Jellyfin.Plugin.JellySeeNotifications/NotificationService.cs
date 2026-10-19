@@ -21,6 +21,7 @@ public sealed class NotificationService : BackgroundService
     private readonly Func<(string Directory, string Root)> statePaths;
     private readonly TimeSpan stateIoTimeout;
     private readonly Func<TimeSpan, CancellationToken, Task> stateRetryDelay;
+    private readonly TimeProvider timeProvider;
     private long channelDropped;
     private bool enabled;
     private string setupHash = "";
@@ -36,11 +37,12 @@ public sealed class NotificationService : BackgroundService
 
     internal NotificationService(ILibraryManager library, IJellyfinCompat compat, IServerApplicationHost host, RelayClient relay, ILogger<NotificationService> logger,
         Func<PluginConfiguration> configuration, Func<(string Directory, string Root)> statePaths, TimeSpan stateIoTimeout,
-        Func<TimeSpan, CancellationToken, Task>? stateRetryDelay = null)
+        Func<TimeSpan, CancellationToken, Task>? stateRetryDelay = null, TimeProvider? timeProvider = null)
     {
         this.library = library; this.compat = compat; this.host = host; this.relay = relay; this.logger = logger;
         this.configuration = configuration; this.statePaths = statePaths; this.stateIoTimeout = stateIoTimeout;
         this.stateRetryDelay = stateRetryDelay ?? Task.Delay;
+        this.timeProvider = timeProvider ?? TimeProvider.System;
         channel = Channel.CreateBounded<Signal>(new BoundedChannelOptions(State.Capacity) { SingleReader = true, FullMode = BoundedChannelFullMode.DropOldest }, _ => Interlocked.Increment(ref channelDropped));
     }
     private void Added(object? sender, ItemChangeEventArgs e)
@@ -73,20 +75,38 @@ public sealed class NotificationService : BackgroundService
         // Reopen/replay after a completed sharing failure: a failed append or
         // fsync may already be durable, so never blindly repeat a transaction.
         int failures = 0;
+        long? lastFailureLog = null, lastFailureHeartbeat = null;
+        void Healthy()
+        {
+            failures = 0; lastFailureLog = null; lastFailureHeartbeat = null;
+        }
         while (!ct.IsCancellationRequested)
         {
-            try { await Run(ct); return; }
+            try { await Run(ct, Healthy); return; }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
             catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException))
             {
+                // Shutdown may race a sharing failure or worker cleanup. Do
+                // not turn cancellation into a timeout diagnostic or heartbeat.
+                if (ct.IsCancellationRequested) return;
                 Volatile.Write(ref enabled, false);
                 SetError("stateUnavailable");
-                var cause = StateFailure.Cause(ex);
-                // Never pass the exception itself, its message, paths or IDs.
-                logger.LogError("[JellySee Notifications] State unavailable (stateUnavailable); exceptionType={ExceptionType}; hResult={HResult:X8}",
-                    cause.GetType().FullName, cause.HResult);
-                await ReportStateUnavailable(ct);
-                if (!StateFailure.IsSharing(ex)) return;
+                bool retryable = StateFailure.IsSharing(ex);
+                long now = timeProvider.GetTimestamp();
+                if (!retryable || lastFailureLog is null || timeProvider.GetElapsedTime(lastFailureLog.Value, now) >= TimeSpan.FromHours(1))
+                {
+                    var cause = StateFailure.Cause(ex);
+                    // Never pass the exception itself, its message, paths or IDs.
+                    logger.LogError("[JellySee Notifications] State unavailable (stateUnavailable); exceptionType={ExceptionType}; hResult={HResult:X8}",
+                        cause.GetType().FullName, cause.HResult);
+                    lastFailureLog = now;
+                }
+                // Failure reports share the relay's 12/hour setup budget.
+                // Leave room for the first normal heartbeat after recovery;
+                // this cooldown never gates that normal heartbeat.
+                bool heartbeatDue = lastFailureHeartbeat is null || timeProvider.GetElapsedTime(lastFailureHeartbeat.Value, now) >= TimeSpan.FromMinutes(15);
+                if (await ReportStateUnavailable(ct, heartbeatDue)) lastFailureHeartbeat = now;
+                if (!retryable) return;
             }
             finally
             {
@@ -98,7 +118,7 @@ public sealed class NotificationService : BackgroundService
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
         }
     }
-    private async Task ReportStateUnavailable(CancellationToken ct)
+    private async Task<bool> ReportStateUnavailable(CancellationToken ct, bool heartbeatDue)
     {
         // A timed-out worker may still own/mutate its state. Health must never
         // inspect it or retry its path; only completed workers can be reopened.
@@ -106,26 +126,34 @@ public sealed class NotificationService : BackgroundService
         {
             var config = configuration();
             config.Status = "stateUnavailable";
-            if (config.Enabled && !string.IsNullOrWhiteSpace(config.Secret) && !ct.IsCancellationRequested)
-                await relay.Post(config.RelayOrigin, Identity.ServerKey(host.SystemId), config.Secret, "heartbeat",
-                    Heartbeat.Encode(host.SystemId, new State(), Now, "stateUnavailable", false, 0), [], ct);
+            if (heartbeatDue && config.Enabled && !string.IsNullOrWhiteSpace(config.Secret) && !ct.IsCancellationRequested)
+            {
+                // Count attempts even on transport failure: the relay may have
+                // consumed its budget before the response was lost.
+                try { await relay.Post(config.RelayOrigin, Identity.ServerKey(host.SystemId), config.Secret, "heartbeat",
+                    Heartbeat.Encode(host.SystemId, new State(), Now, "stateUnavailable", false, 0), [], ct); }
+                catch (Exception ex) when (ex is not OutOfMemoryException) { }
+                return true;
+            }
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
-        { /* Keep the fixed dashboard failure even if the one-shot heartbeat fails. */ }
+        { /* Keep the fixed dashboard failure even if configuration lookup fails. */ }
+        return false;
     }
-    private async Task Run(CancellationToken ct)
+    private async Task Run(CancellationToken ct, Action healthy)
     {
         var paths = statePaths();
         using var journal = new Journal(paths.Directory, paths.Root, ct, stateIoTimeout);
-        try { await RunJournal(journal, ct); }
+        try { await RunJournal(journal, ct, healthy); }
         catch (Exception ex) when (StateFailure.IsSharing(ex))
         {
             journal.Dispose();
+            ct.ThrowIfCancellationRequested();
             if (!journal.CanRestart) throw new StatePersistenceException(new TimeoutException());
             throw;
         }
     }
-    private async Task RunJournal(Journal journal, CancellationToken ct)
+    private async Task RunJournal(Journal journal, CancellationToken ct, Action healthy)
     {
         if (error == "stateUnavailable") SetError("none");
         string key = Identity.ServerKey(host.SystemId);
@@ -319,6 +347,9 @@ public sealed class NotificationService : BackgroundService
             config.OutboxDepth = journal.State.Notices.Values.Count(n => n.Stage == "outbox");
             config.BaselineLibrariesRemaining = journal.State.Libraries.Values.Count(l => !l.BaselineComplete);
             journal.MaybeCompact();
+            // Reopening alone is insufficient: a failure in this first full
+            // iteration still belongs to the same persistence-failure streak.
+            healthy();
         }, code =>
         {
             if (code != "none" || error == "adapterUnavailable") SetError(code);

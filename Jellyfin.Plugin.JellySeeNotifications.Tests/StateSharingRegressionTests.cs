@@ -1,4 +1,6 @@
 using System.Reflection;
+using System.Net;
+using System.Text.Json;
 using Jellyfin.Plugin.JellySeeNotifications.Core;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Library;
@@ -257,6 +259,163 @@ public sealed class StateSharingRegressionTests
         worker.Invoke(() => { });
         try { worker.Dispose(); Assert.False(worker.CanRestart); }
         finally { release.Set(); }
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task RetryHeartbeatBudgetLeavesRoomForImmediateRecoveryHeartbeat(bool unavailableResponseFails)
+    {
+        using var temp = new TempDirectory();
+        var clock = new ManualClock(); var config = new PluginConfiguration { Enabled = true, Secret = "fixture-secret" };
+        var logger = new RecordingLogger(); int opens = 0, delays = 0;
+        List<(long At, string Error)> posts = [];
+        var recovered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var relay = new RelayClient(new RecordingHandler(request =>
+        {
+            using var json = JsonDocument.Parse(request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult());
+            string error = json.RootElement.GetProperty("errorCode").GetString()!;
+            posts.Add((clock.GetTimestamp() / TimeSpan.TicksPerSecond, error));
+            // Same fixed-hour budget as the relay. All attempts, including
+            // failed responses, consume it. Recovery is inside that same hour.
+            bool allowed = posts.Count <= 12;
+            if (error != "stateUnavailable") recovered.TrySetResult(allowed);
+            return new HttpResponseMessage(!allowed ? HttpStatusCode.TooManyRequests :
+                error == "stateUnavailable" && unavailableResponseFails ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.OK);
+        }));
+        using var service = new NotificationService(Proxy<ILibraryManager>((_, _) => null),
+            Proxy<IJellyfinCompat>((method, _) => method.Name switch
+            {
+                "Inventory" => Array.Empty<Library>(), "Users" => Array.Empty<string>(),
+                _ => throw new InvalidOperationException("Unexpected adapter call")
+            }), Proxy<IServerApplicationHost>((_, _) => "fixture-server"), relay, logger,
+            () => config, () => ++opens <= 60 ? throw Sharing(32) : (temp.Path, Path.GetDirectoryName(temp.Path)!),
+            TimeSpan.FromSeconds(3), (_, _) =>
+            {
+                Assert.Equal("stateUnavailable", config.Status);
+                if (++delays < 60) clock.Advance(TimeSpan.FromMinutes(1));
+                return Task.CompletedTask;
+            }, clock);
+        await service.StartAsync(default);
+        try
+        {
+            Assert.True(await recovered.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+            Assert.Equal(new long[] { 0, 900, 1800, 2700 }, posts.Where(p => p.Error == "stateUnavailable").Select(p => p.At));
+            Assert.Equal(3540, posts[^1].At); // recovery bypasses failure-report cooldown
+            Assert.NotEqual("stateUnavailable", posts[^1].Error);
+            Assert.Equal(5, posts.Count); Assert.Single(logger.Messages);
+        }
+        finally { await service.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(2)); }
+    }
+
+    [Fact] public async Task UnavailableHeartbeatAttemptsRespectFifteenMinuteBoundaryEvenWhenTransportThrows()
+    {
+        using var stop = new CancellationTokenSource();
+        var clock = new ManualClock(); var config = new PluginConfiguration { Enabled = true, Secret = "fixture-secret" };
+        long[] times = [0, 899, 900, 901, 1799, 1800]; int[] counts = [1, 1, 2, 2, 2, 3];
+        int attempt = 0, posts = 0;
+        using var relay = new RelayClient(new RecordingHandler(_ => { posts++; throw new HttpRequestException("private-path-secret"); }));
+        using var service = new NotificationService(Proxy<ILibraryManager>((_, _) => null),
+            Proxy<IJellyfinCompat>((_, _) => null), Proxy<IServerApplicationHost>((_, _) => "fixture-server"), relay, new RecordingLogger(),
+            () => config, () => throw Sharing(32), TimeSpan.FromSeconds(1), (_, _) =>
+            {
+                Assert.Equal(counts[attempt], posts); Assert.Equal("stateUnavailable", config.Status);
+                if (++attempt == times.Length) stop.Cancel();
+                else clock.AdvanceTo(times[attempt]);
+                return Task.CompletedTask;
+            }, clock);
+        await service.StartAsync(stop.Token);
+        await service.ExecuteTask!.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.Equal(3, posts);
+    }
+
+    [Fact] public async Task RetryLogsAreHourlyWithinStreakAndTerminalFailuresAreAlwaysLogged()
+    {
+        var clock = new ManualClock(); var config = new PluginConfiguration(); var logger = new RecordingLogger();
+        long[] times = [0, 3599, 3600, 3601, 7199, 7200]; int[] counts = [1, 1, 2, 2, 2, 3];
+        int attempt = 0, failures = 0;
+        using var relay = new RelayClient(new NoNetwork());
+        using var service = new NotificationService(Proxy<ILibraryManager>((_, _) => null),
+            Proxy<IJellyfinCompat>((_, _) => null), Proxy<IServerApplicationHost>((_, _) => "fixture-server"), relay, logger,
+            () => config, () => throw Sharing(++failures <= times.Length ? 32 : 5), TimeSpan.FromSeconds(1), (_, _) =>
+            {
+                Assert.Equal(counts[attempt], logger.Messages.Count);
+                if (++attempt < times.Length) clock.AdvanceTo(times[attempt]);
+                return Task.CompletedTask;
+            }, clock);
+        await service.StartAsync(default);
+        await service.ExecuteTask!.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.Equal(4, logger.Messages.Count); Assert.Contains("80070005", logger.Messages[^1]);
+        Assert.All(logger.Messages, message => Assert.DoesNotContain("private-path-secret", message));
+        Assert.All(logger.Exceptions, Assert.Null);
+    }
+
+    [Fact] public async Task RetryStreakResetsAfterFullHealthyIterationButNotJustSuccessfulReopen()
+    {
+        using var temp = new TempDirectory();
+        var config = new PluginConfiguration(); var logger = new RecordingLogger();
+        int opens = 0, generation = 0; bool failedFirstIteration = false, failedAfterHealthy = false;
+        List<double> delays = [];
+        var healthyAgain = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var relay = new RelayClient(new NoNetwork());
+        using var service = new NotificationService(Proxy<ILibraryManager>((_, _) => null),
+            Proxy<IJellyfinCompat>((_, _) => throw new InvalidOperationException()), Proxy<IServerApplicationHost>((_, _) => "fixture-server"), relay, logger,
+            () =>
+            {
+                if (generation == 1 && !failedFirstIteration)
+                { failedFirstIteration = true; throw new StatePersistenceException(Sharing(32)); }
+                if (generation == 2 && config.Status == "notConfigured" && !failedAfterHealthy)
+                { failedAfterHealthy = true; throw new StatePersistenceException(Sharing(32)); }
+                if (generation == 3 && config.Status == "notConfigured") healthyAgain.TrySetResult();
+                return config;
+            }, () =>
+            {
+                if (++opens <= 9) throw Sharing(32);
+                generation = opens - 9;
+                return (temp.Path, Path.GetDirectoryName(temp.Path)!);
+            }, TimeSpan.FromSeconds(3), (pause, _) => { delays.Add(pause.TotalSeconds); return Task.CompletedTask; });
+        await service.StartAsync(default);
+        try
+        {
+            await healthyAgain.Task.WaitAsync(TimeSpan.FromSeconds(6));
+            Assert.Equal(new double[] { 1, 2, 4, 8, 16, 32, 60, 60, 60, 60, 1 }, delays);
+            Assert.Equal(12, opens); Assert.Equal(2, logger.Messages.Count);
+        }
+        finally { await service.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(2)); }
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task ShutdownRacingSharingFailureDoesNotLogTimeoutOrReportStateUnavailable(bool afterLoad)
+    {
+        using var temp = new TempDirectory(); using var stop = new CancellationTokenSource();
+        var config = new PluginConfiguration { Enabled = true, Secret = "fixture-secret" }; var logger = new RecordingLogger();
+        int posts = 0, retries = 0;
+        using var relay = new RelayClient(new RecordingHandler(_ => { posts++; return new HttpResponseMessage(HttpStatusCode.OK); }));
+        using var service = new NotificationService(Proxy<ILibraryManager>((_, _) => null),
+            Proxy<IJellyfinCompat>((_, _) => throw new InvalidOperationException()), Proxy<IServerApplicationHost>((_, _) => "fixture-server"), relay, logger,
+            () => { stop.Cancel(); throw new StatePersistenceException(Sharing(32)); },
+            () =>
+            {
+                if (!afterLoad) { stop.Cancel(); throw Sharing(32); }
+                return (temp.Path, Path.GetDirectoryName(temp.Path)!);
+            }, TimeSpan.FromSeconds(3), (_, _) => { retries++; return Task.CompletedTask; });
+        await service.StartAsync(stop.Token);
+        await service.ExecuteTask!.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.Empty(logger.Messages); Assert.Equal(0, posts); Assert.Equal(0, retries);
+        Assert.NotEqual("stateUnavailable", config.Status);
+    }
+
+    private sealed class ManualClock : TimeProvider
+    {
+        private long timestamp;
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+        public override long GetTimestamp() => timestamp;
+        internal void Advance(TimeSpan duration) => timestamp += duration.Ticks;
+        internal void AdvanceTo(long seconds) => timestamp = seconds * TimeSpan.TicksPerSecond;
+    }
+    private sealed class RecordingHandler(Func<HttpRequestMessage, HttpResponseMessage> send) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct) => Task.FromResult(send(request));
     }
 
     private static Exception Recoverable(int code) => code == 5

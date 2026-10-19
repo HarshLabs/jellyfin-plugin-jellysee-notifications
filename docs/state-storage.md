@@ -106,7 +106,17 @@ remain cancellable, with callbacks disabled and subscriptions removed between
 attempts. The bounded callback channel survives retries; callbacks missed while
 disabled use startup reconciliation as their catch-up path. Other I/O failures,
 failed/stalled cleanup and timeouts stay terminal. Each failed attempt sets the
-dashboard health and attempts the existing bounded heartbeat when configured.
+dashboard health. When configured, the first failure in a streak attempts the
+existing bounded heartbeat; further attempts are at least fifteen minutes apart,
+including when the response fails or is lost. This preserves room in the relay's
+12/hour/setup heartbeat budget for the immediate normal heartbeat after recovery;
+the failure-report cooldown does not gate normal heartbeats. Retryable failures
+log on the first failure and at most once per hour thereafter. Terminal failures
+always log. The cooldowns use monotonic time, so wall-clock corrections do not
+cause a burst of reports. A full successful journal iteration (including size
+probes and any compaction) resets the backoff and report streak; opening the
+journal alone does not. Shutdown cancellation takes precedence over incomplete
+cleanup checks and failure reporting, so it does not appear as a timeout error.
 Logs include a fixed message plus the underlying exception type and HResult,
 without exception objects, messages, paths or IDs.
 

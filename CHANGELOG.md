@@ -10,6 +10,10 @@
   access denial) by closing the worker and replaying
   durable state, with cancellable retries from one to sixty seconds. Timeouts
   and failed/stalled cleanup remain terminal.
+- Throttle retry-streak outage heartbeats to the first failure and at most every
+  fifteen minutes, and retry error logs to the first failure and at most hourly.
+  A full healthy iteration resets retry backoff; terminal failures always log.
+  Shutdown cancellation does not generate misleading state timeout diagnostics.
 - Include only exception type and HResult alongside the fixed state failure log.
 - Add sharing, replacement, compaction, quarantine, reopen and retry regressions.
   Preserve CreateNew temporaries, link/containment checks, I/O bounds and caps.

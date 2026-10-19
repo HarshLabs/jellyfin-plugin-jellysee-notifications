@@ -63,6 +63,12 @@ exit or the call returns. Completed Windows sharing/lock violations (HResults
 `80070020`/`80070021`, plus access denial specifically during an overwrite-move)
 instead close the worker, reopen and replay durable state,
 and retry with delays from one to sixty seconds until access recovers or shutdown.
+A full successful journal iteration resets that backoff and ends the failure
+streak; merely reopening does not. Retry streaks send an outage heartbeat on the
+first failure and at most once every fifteen minutes thereafter, leaving room in
+the relay budget for the immediate normal heartbeat after recovery. Persistent
+retry errors log once initially and at most hourly; terminal errors always log.
+Shutdown cancellation produces no state-failure diagnostic or heartbeat.
 A worker whose cleanup fails or stalls cannot be reopened. Size probes use checked
 file metadata without opening a reader against the live journal writer.
 Startup replay closes its source reader before replacing the journal; compaction
