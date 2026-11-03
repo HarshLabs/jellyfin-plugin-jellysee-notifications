@@ -83,10 +83,10 @@ Logs contain fixed codes, exception type and HResult only; diagnostics contain
 UTC, monotonic time and fixed cause codes, with a 256 KiB cap and independent I/O.
 Runtime health and counters are separate from saved configuration.
 
-New state lives under `v6/`; migration prefers a completed `v5/`, then `v4/`,
-preserving provenance, or imports legacy files as recovery. All predecessors stay
-untouched for downgrade. Re-upgrade resumes v6. Old re-add observations become
-ordinary pending additions before metadata evaluation.
+1.1 state lives under `v6/`, retained as the sole versioned directory to minimize
+schema/path churn. Only the released 1.0.1 root layout is imported, with notice
+provenance classified as recovery. Legacy files stay untouched for downgrade;
+re-upgrade resumes v6. Unreleased v4/v5 state is not imported.
 See [storage details](docs/state-storage.md) for containment, atomic replacement,
 recovery and residual filesystem limits.
 

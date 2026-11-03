@@ -4,7 +4,6 @@ using System.Net;
 using System.Reflection;
 using System.Security.Claims;
 using System.Text.Json;
-using System.Text.Json.Nodes;
 using Jellyfin.Plugin.JellySeeNotifications.Core;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Entities;
@@ -260,50 +259,6 @@ public sealed class ReliabilityTests
         j.Commit(new Change { Kind = "retire", Key = Id(10001) }, new() { Kind = "retire", Key = Id(19999) });
         e.QueueAdd(Id(999), "Movie", Id(19999), 1002, Setup, receiptCoverage: next);
         Assert.True(j.State.Notices.ContainsKey(Id(19999))); Assert.Equal(1, j.State.Health.Dropped); j.Compact();
-    }
-
-    [Fact] public void V5BulkReplayKeepsItsPredecessorExclusionPredicate()
-    {
-        using var temp = new TempDirectory(); string previous = Path.Combine(temp.Path, "v5"); Directory.CreateDirectory(previous);
-        string fixture = Path.Combine(AppContext.BaseDirectory, "Fixtures", "v5-bulk-quiet-pending");
-        foreach (string file in Directory.EnumerateFiles(fixture)) File.Copy(file, Path.Combine(previous, Path.GetFileName(file)));
-        File.WriteAllBytes(Path.Combine(previous, "migration.complete"), [1]);
-        using var upgraded = new Journal(temp.Path, Path.GetDirectoryName(temp.Path)!, default, TimeSpan.FromSeconds(3), versioned: true);
-        Assert.False(upgraded.RecoveredCorruption);
-        Assert.Equal(201, Assert.Single(upgraded.State.Notices.Values, n => n.Op == "rmbulk").Count);
-    }
-
-    [Theory]
-    [InlineData(false, false, false)] [InlineData(false, false, true)] [InlineData(false, true, false)] [InlineData(false, true, true)]
-    [InlineData(true, false, false)] [InlineData(true, false, true)] [InlineData(true, true, false)] [InlineData(true, true, true)]
-    public void ActualV5ObservationsMigrateToPendingWorkWithoutChangingPredecessors(bool snapshot, bool owed, bool present)
-    {
-        using var temp = new TempDirectory(); string previous = Path.Combine(temp.Path, "v5"); Directory.CreateDirectory(previous);
-        string fixture = Path.Combine(AppContext.BaseDirectory, "Fixtures", $"v5-observed-{(snapshot ? "snapshot" : "journal")}-{(owed ? "owed" : "quiet")}");
-        foreach (string file in Directory.EnumerateFiles(fixture)) File.Copy(file, Path.Combine(previous, Path.GetFileName(file)));
-        File.WriteAllBytes(Path.Combine(previous, "migration.complete"), [1]);
-        var before = Directory.EnumerateFiles(previous).ToDictionary(file => Path.GetFileName(file)!, File.ReadAllBytes);
-        var m = new Model { ReadPending = true }; m.Add(1);
-        using (var upgraded = new Journal(temp.Path, Path.GetDirectoryName(temp.Path)!, default, TimeSpan.FromSeconds(3), versioned: true))
-        {
-            Assert.False(upgraded.RecoveredCorruption); var engine = new Engine(upgraded, m, "key");
-            Assert.Equal(0, m.ReadCalls); Assert.All(upgraded.State.Notices.Values, n => Assert.Null(n.LegacyReaddObservedAt));
-            Assert.Equal(owed ? 2 : 1, upgraded.State.Notices.Values.Count(n => n.Stage == "pendingAdd")); upgraded.Compact();
-        }
-        using (var resumed = new Journal(temp.Path, Path.GetDirectoryName(temp.Path)!, default, TimeSpan.FromSeconds(3), versioned: true))
-        {
-            Assert.False(resumed.RecoveredCorruption); var engine = new Engine(resumed, m, "key");
-            if (!present) m.Items.Clear(); m.ReadPending = false;
-            engine.AdvanceAdds(1602, _ => { }); engine.AdvanceRemovals(1602, _ => { });
-            if (present)
-            {
-                Assert.DoesNotContain(resumed.State.Notices.Values, n => n.Op == "rm");
-                Assert.Equal(owed ? 1 : 0, resumed.State.Notices.Values.Count(n => Rules.Audible(n, 1602)));
-                if (owed) Assert.Equal(1000, resumed.State.Notices[Id(100)].FirstSeenAt);
-            }
-            else Assert.Equal("rm", Assert.Single(resumed.State.Notices.Values).Op);
-        }
-        foreach (var file in before) Assert.Equal(file.Value, File.ReadAllBytes(Path.Combine(previous, file.Key!)));
     }
 
     [Theory] [InlineData(true)] [InlineData(false)]
@@ -602,39 +557,24 @@ public sealed class ReliabilityTests
         Assert.Single(j.State.Notices.Values, n => n.Op == "summary");
     }
 
-    [Fact] public void VersionedMigrationPreservesV4RollbackFilesAndLiveProvenance()
-    {
-        using var temp = new TempDirectory(); string previous = Path.Combine(temp.Path, "v4"); Directory.CreateDirectory(previous);
-        var m = new Model(); m.Add(1);
-        using (var old = new Journal(previous))
-        {
-            Bound(old); var e = new Engine(old, m, "key"); e.QueueAdd(Id(1), "Movie", Id(100), 1000, Setup); e.AdvanceAdds(1001, _ => { }); old.Compact();
-        }
-        File.WriteAllBytes(Path.Combine(previous, "migration.complete"), [1]);
-        byte[] snapshot = File.ReadAllBytes(Path.Combine(previous, "snapshot.bin")), log = File.ReadAllBytes(Path.Combine(previous, "journal.ndjson"));
-        using (var upgraded = new Journal(temp.Path, Path.GetDirectoryName(temp.Path)!, default, TimeSpan.FromSeconds(3), versioned: true))
-        {
-            Assert.Equal("live", Assert.Single(upgraded.State.Notices.Values).Origin);
-            new Engine(upgraded, m, "key").Remove(Id(1), Id(101), 1002, Setup); upgraded.Compact();
-        }
-        Assert.Equal(snapshot, File.ReadAllBytes(Path.Combine(previous, "snapshot.bin"))); Assert.Equal(log, File.ReadAllBytes(Path.Combine(previous, "journal.ndjson")));
-        using (var downgrade = new Journal(previous)) { Assert.Single(downgrade.State.Notices); Assert.Single(downgrade.State.Bindings); Assert.False(downgrade.RecoveredCorruption); }
-        using var resumed = new Journal(temp.Path, Path.GetDirectoryName(temp.Path)!, default, TimeSpan.FromSeconds(3), versioned: true);
-        Assert.Equal(Id(100), resumed.State.Tombstones[Id(1)].UnannouncedAdd!.EventId); Assert.False(resumed.RecoveredCorruption);
-    }
-
-    [Fact] public void VersionedMigrationClassifiesOldNoticesRecoveryAndLeavesDowngradeFilesUnchanged()
+    [Theory] [InlineData("journal")] [InlineData("snapshot")]
+    public void VersionedMigrationClassifiesOldNoticesRecoveryAndLeavesDowngradeFilesUnchanged(string layout)
     {
         using var temp = new TempDirectory();
-        var notice = JsonSerializer.SerializeToNode(Event())!.AsObject(); notice.Remove("Origin"); notice.Remove("FirstSeenAt");
-        string payload = new JsonObject { ["Seq"] = 1, ["Changes"] = new JsonArray(new JsonObject { ["Kind"] = "notice", ["Notice"] = notice }) }.ToJsonString();
-        byte[] original = System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { Payload = payload, Sha256 = Identity.Hash(payload) }) + "\n");
-        File.WriteAllBytes(Path.Combine(temp.Path, "journal.ndjson"), original);
+        string fixture = Path.Combine(AppContext.BaseDirectory, "Fixtures", "legacy-1.0.1-" + layout);
+        foreach (string file in Directory.EnumerateFiles(fixture)) File.Copy(file, Path.Combine(temp.Path, Path.GetFileName(file)));
+        var original = Directory.EnumerateFiles(temp.Path).ToDictionary(file => Path.GetFileName(file)!, File.ReadAllBytes);
         using (var upgraded = new Journal(temp.Path, Path.GetDirectoryName(temp.Path)!, default, TimeSpan.FromSeconds(3), versioned: true))
-        { var n = Assert.Single(upgraded.State.Notices.Values); Assert.Equal("recovery", n.Origin); Assert.Equal(n.QueuedAt, n.FirstSeenAt); upgraded.Commit(new Change { Kind = "health", Health = new(Dropped: 42) }); }
-        Assert.Equal(original, File.ReadAllBytes(Path.Combine(temp.Path, "journal.ndjson")));
-        using var downgrade = new Journal(temp.Path); Assert.Single(downgrade.State.Notices); Assert.Equal(0, downgrade.State.Health.Dropped);
-        using var reupgrade = new Journal(temp.Path, Path.GetDirectoryName(temp.Path)!, default, TimeSpan.FromSeconds(3), versioned: true); Assert.Equal(42, reupgrade.State.Health.Dropped);
+        {
+            Assert.False(upgraded.RecoveredCorruption); var n = Assert.Single(upgraded.State.Notices.Values);
+            Assert.Equal("recovery", n.Origin); Assert.Equal(n.QueuedAt, n.FirstSeenAt); Assert.Single(upgraded.State.Index);
+            upgraded.Commit(new Change { Kind = "health", Health = new(Dropped: 42) }); upgraded.Compact();
+        }
+        foreach (var file in original) Assert.Equal(file.Value, File.ReadAllBytes(Path.Combine(temp.Path, file.Key!)));
+        using (var downgrade = new Journal(temp.Path))
+        { Assert.False(downgrade.RecoveredCorruption); Assert.Single(downgrade.State.Notices); Assert.Single(downgrade.State.Index); Assert.Equal(7, downgrade.State.Health.Dropped); }
+        using var reupgrade = new Journal(temp.Path, Path.GetDirectoryName(temp.Path)!, default, TimeSpan.FromSeconds(3), versioned: true);
+        Assert.False(reupgrade.RecoveredCorruption); Assert.Equal(42, reupgrade.State.Health.Dropped);
     }
 
     [Theory] [InlineData("ids")] [InlineData("describe")]

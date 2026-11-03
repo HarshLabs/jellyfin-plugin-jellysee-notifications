@@ -51,11 +51,8 @@ public sealed record Notice
     public string? OutageId { get; init; }
     public string? Profile { get; init; }
     public string? PresentationKey { get; init; }
-    // Null is predecessor/prevalidated work; empty is a conservative proof with no covered folders.
+    // Null is imported/prevalidated work; empty is a conservative proof with no covered folders.
     public string? CoverageId { get; init; }
-    // Decode predecessor journals only; Engine converts these before evaluating any work.
-    [System.Text.Json.Serialization.JsonPropertyName("ReaddObservedAt")]
-    public long? LegacyReaddObservedAt { get; init; }
     public long HoldUntil { get; init; }
     public bool HoldForScan { get; init; }
     [System.Text.Json.Serialization.JsonConverter(typeof(AudienceConverter))]

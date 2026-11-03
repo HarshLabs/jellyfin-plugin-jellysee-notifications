@@ -34,7 +34,6 @@ public sealed record Change
 public sealed class State
 {
     public const int Capacity = 5000;
-    internal bool ReplayLegacyBulk { get; set; }
     public const int CoverageFolderCapacity = 64_000;
     public Dictionary<string, CoverageProof> Coverages { get; } = new(StringComparer.Ordinal);
     public const int IndexCapacity = 200_000;
@@ -125,7 +124,7 @@ public sealed class State
     private void ValidateNotice(Notice notice)
     {
         Wire.Validate(notice);
-        if (!Coverage(notice.CoverageId) || notice.LegacyReaddObservedAt is < 0 || notice.LegacyReaddObservedAt is not null && notice.Op != "rm" || notice.ReadyAt < 0 || notice.EnqueuedSeq < 0 || !Digest(notice.ProviderDigest) || !Setup(notice.SetupHash) || notice.Stage is not ("pendingAdd" or "pendingRemove" or "outbox") ||
+        if (!Coverage(notice.CoverageId) || notice.ReadyAt < 0 || notice.EnqueuedSeq < 0 || !Digest(notice.ProviderDigest) || !Setup(notice.SetupHash) || notice.Stage is not ("pendingAdd" or "pendingRemove" or "outbox") ||
             notice.Stage == "pendingAdd" && notice.Op != "add" || notice.Stage == "pendingRemove" && notice.Op != "rm")
             throw new InvalidDataException("Invalid notice state");
     }
@@ -154,8 +153,8 @@ public sealed class State
                 ValidateNotice(bulk);
                 if (bulk.Op != "rmbulk" || bulk.Stage != "outbox" || !long.TryParse(c.Key, out long end) || end < bulk.QueuedAt || end - bulk.QueuedAt > 600)
                     throw new InvalidDataException("Invalid bulk window");
-                var bulkHolds = c.ExcludePendingReadds ? Rules.PendingReadds(Notices.Values, Index, ReplayLegacyBulk) : null;
-                var members = Notices.Values.Where(n => n.Stage == "pendingRemove" && (bulkHolds is null || !Rules.AwaitingReadd(n, bulkHolds, ReplayLegacyBulk)) && n.SetupHash == bulk.SetupHash && n.Origin == bulk.Origin && n.Quiet == bulk.Quiet && n.QueuedAt >= bulk.QueuedAt && n.QueuedAt <= end && n.Folders.Contains(bulk.Folders[0])).ToArray();
+                var bulkHolds = c.ExcludePendingReadds ? Rules.PendingReadds(Notices.Values, Index) : null;
+                var members = Notices.Values.Where(n => n.Stage == "pendingRemove" && (bulkHolds is null || !Rules.AwaitingReadd(n, bulkHolds)) && n.SetupHash == bulk.SetupHash && n.Origin == bulk.Origin && n.Quiet == bulk.Quiet && n.QueuedAt >= bulk.QueuedAt && n.QueuedAt <= end && n.Folders.Contains(bulk.Folders[0])).ToArray();
                 if (members.Length <= 200 || bulk.Count != members.Length || !members.Any(n => n.EventId == bulk.EventId))
                     throw new InvalidDataException("Invalid bulk members");
                 foreach (var member in members)
@@ -273,8 +272,8 @@ public sealed class State
 public static class Rules
 {
     public const int MoveWindow = 600;
-    public static ILookup<(string? Id, string Setup), Notice> PendingReadds(IEnumerable<Notice> notices, IReadOnlyDictionary<string, Title> index, bool legacy = false) => notices.Where(a => a.Stage == "pendingAdd" && (legacy || !index.ContainsKey(a.Id!))).ToLookup(a => (a.Id, a.SetupHash));
-    public static bool AwaitingReadd(Notice removal, ILookup<(string? Id, string Setup), Notice> pending, bool legacy = false) => removal.LegacyReaddObservedAt is not null || (!legacy || !removal.Quiet) && pending[(removal.Id, removal.SetupHash)].Any(a => a.QueuedAt >= removal.FirstSeenAt && a.QueuedAt - removal.FirstSeenAt < MoveWindow);
+    public static ILookup<(string? Id, string Setup), Notice> PendingReadds(IEnumerable<Notice> notices, IReadOnlyDictionary<string, Title> index) => notices.Where(a => a.Stage == "pendingAdd" && !index.ContainsKey(a.Id!)).ToLookup(a => (a.Id, a.SetupHash));
+    public static bool AwaitingReadd(Notice removal, ILookup<(string? Id, string Setup), Notice> pending) => pending[(removal.Id, removal.SetupHash)].Any(a => a.QueuedAt >= removal.FirstSeenAt && a.QueuedAt - removal.FirstSeenAt < MoveWindow);
     public static bool Audible(Notice n, long now) => n.Origin == "live" && !n.Quiet && now - n.FirstSeenAt <= 1800 && n.FirstSeenAt <= now + 120;
     public static bool Ready(string type, bool providers, bool refreshed, long queuedAt, long now) =>
         now - queuedAt >= 900 || refreshed && (type is "Book" or "AudioBook" || providers);

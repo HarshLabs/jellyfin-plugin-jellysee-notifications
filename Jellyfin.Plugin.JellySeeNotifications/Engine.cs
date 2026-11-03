@@ -10,7 +10,7 @@ public sealed class Engine
     private readonly INotificationLibrary source;
     private readonly string serverKey;
     public Engine(Journal journal, IJellyfinCompat compat, string serverKey) : this(journal, new DirectLibrary(compat, serverKey), serverKey) { }
-    internal Engine(Journal journal, INotificationLibrary source, string serverKey) { this.journal = journal; this.source = source; this.serverKey = serverKey; ImportLegacyReadds(); }
+    internal Engine(Journal journal, INotificationLibrary source, string serverKey) { this.journal = journal; this.source = source; this.serverKey = serverKey; }
     internal Func<bool> BudgetAvailable { get; set; } = () => true;
     internal bool WorkPending { get; private set; }
     internal void ResetPendingWork() => WorkPending = false;
@@ -77,16 +77,6 @@ public sealed class Engine
         changes.Add(new() { Kind = "notice", Notice = original });
         changes.Add(new() { Kind = "notice", Notice = hint with { EnqueuedSeq = State.Seq + 1 } });
         journal.Commit(changes.ToArray());
-    }
-    private void ImportLegacyReadds()
-    {
-        foreach (var removal in State.Notices.Values.Where(n => n.LegacyReaddObservedAt is not null).ToArray())
-        {
-            long at = removal.LegacyReaddObservedAt!.Value;
-            // Old markers had no receipt coverage. Only a carried original has proven live eligibility.
-            QueueAdd(removal.Id!, removal.Type!, Identity.Hash(removal.EventId + ":readd:" + at)[..32], at, removal.SetupHash, "recovery");
-            if (State.Notices.TryGetValue(removal.EventId, out var retained)) Put(retained with { LegacyReaddObservedAt = null });
-        }
     }
     private bool AdmitCoverage(string[]? folders, out string? id)
     {
