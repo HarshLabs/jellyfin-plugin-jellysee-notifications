@@ -1,10 +1,12 @@
+using System.Text.Json.Serialization;
 using System.Text.Json;
 
 namespace Jellyfin.Plugin.JellySeeNotifications.Core;
 
 public sealed record Title(string Id, string Type, string[] Folders, string? ProviderDigest, long Seq, int Life);
 public sealed record Lifecycle(string Id, int Life);
-public sealed record Tombstone(string Id, long Seq, long At, int Life);
+public sealed record AddObligation(string EventId, long FirstSeenAt, string SetupHash, string? OutageId = null, long EnqueuedSeq = 0);
+public sealed record Tombstone(string Id, long Seq, long At, int Life, AddObligation? UnannouncedAdd = null);
 public sealed record Addition(string Id, string Type, string[] Folders, string? ProviderDigest, long At, string SetupHash = "");
 // Directory and location fingerprints preserve rename detection without persisting filesystem paths.
 public sealed record Library(string DirectoryKey, string Id, string[] Locations, bool Enabled, bool BaselineComplete, long CoveredUntil = 0);
@@ -12,6 +14,8 @@ public sealed record Health(long Dropped = 0, long? LastAckAt = null, bool Index
 public sealed record Change
 {
     public string Kind { get; init; } = "";
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool ExcludePendingReadds { get; init; }
     public Notice? Notice { get; init; }
     public Title? Title { get; init; }
     public Lifecycle? Lifecycle { get; init; }
@@ -86,7 +90,7 @@ public sealed class State
     {
         // Extraneous payloads must not redirect the rollback key capture away
         // from the record that ApplyCore will actually mutate.
-        if (c is null || (c.Notice is not null) != (c.Kind is "notice" or "bulk") ||
+        if (c is null || c.ExcludePendingReadds && c.Kind != "bulk" || (c.Notice is not null) != (c.Kind is "notice" or "bulk") ||
             (c.Title is not null) != (c.Kind == "title") ||
             (c.Lifecycle is not null) != (c.Kind == "life") ||
             (c.Tombstone is not null) != (c.Kind == "remove") ||
@@ -114,7 +118,7 @@ public sealed class State
     private static void ValidateNotice(Notice notice)
     {
         Wire.Validate(notice);
-        if (notice.ReadyAt < 0 || notice.EnqueuedSeq < 0 || !Digest(notice.ProviderDigest) || !Setup(notice.SetupHash) || notice.Stage is not ("pendingAdd" or "pendingRemove" or "outbox") ||
+        if (notice.ReaddObservedAt is < 0 || notice.ReaddObservedAt is not null && notice.Op != "rm" || notice.ReadyAt < 0 || notice.EnqueuedSeq < 0 || !Digest(notice.ProviderDigest) || !Setup(notice.SetupHash) || notice.Stage is not ("pendingAdd" or "pendingRemove" or "outbox") ||
             notice.Stage == "pendingAdd" && notice.Op != "add" || notice.Stage == "pendingRemove" && notice.Op != "rm")
             throw new InvalidDataException("Invalid notice state");
     }
@@ -134,7 +138,8 @@ public sealed class State
                 ValidateNotice(bulk);
                 if (bulk.Op != "rmbulk" || bulk.Stage != "outbox" || !long.TryParse(c.Key, out long end) || end < bulk.QueuedAt || end - bulk.QueuedAt > 600)
                     throw new InvalidDataException("Invalid bulk window");
-                var members = Notices.Values.Where(n => n.Stage == "pendingRemove" && n.SetupHash == bulk.SetupHash && n.Origin == bulk.Origin && n.Quiet == bulk.Quiet && n.QueuedAt >= bulk.QueuedAt && n.QueuedAt <= end && n.Folders.Contains(bulk.Folders[0])).ToArray();
+                var bulkHolds = c.ExcludePendingReadds ? Rules.PendingReadds(Notices.Values) : null;
+                var members = Notices.Values.Where(n => n.Stage == "pendingRemove" && (bulkHolds is null || !Rules.AwaitingReadd(n, bulkHolds)) && n.SetupHash == bulk.SetupHash && n.Origin == bulk.Origin && n.Quiet == bulk.Quiet && n.QueuedAt >= bulk.QueuedAt && n.QueuedAt <= end && n.Folders.Contains(bulk.Folders[0])).ToArray();
                 if (members.Length <= 200 || bulk.Count != members.Length || !members.Any(n => n.EventId == bulk.EventId))
                     throw new InvalidDataException("Invalid bulk members");
                 foreach (var member in members)
@@ -165,6 +170,7 @@ public sealed class State
             case "remove":
                 var tomb = c.Tombstone ?? throw new InvalidDataException();
                 RequireId(tomb.Id); if (tomb.Life < 0 || tomb.Seq < 0 || tomb.At < 0) throw new InvalidDataException();
+                if (tomb.UnannouncedAdd is { } owed && (!Identity.IsId(owed.EventId) || owed.FirstSeenAt < 0 || owed.EnqueuedSeq < 0 || !Setup(owed.SetupHash) || owed.OutageId is not null && !Identity.IsId(owed.OutageId))) throw new InvalidDataException();
                 if (!Lifecycles.ContainsKey(tomb.Id) && Lifecycles.Count >= LifecycleCapacity) throw new InvalidDataException("Lifecycle cap");
                 Lifecycles[tomb.Id] = Math.Max(Lifecycles.GetValueOrDefault(tomb.Id), tomb.Life);
                 Tombstones[tomb.Id] = tomb; Index.Remove(tomb.Id);
@@ -250,6 +256,8 @@ public sealed class State
 public static class Rules
 {
     public const int MoveWindow = 600;
+    public static ILookup<(string? Id, string Setup), Notice> PendingReadds(IEnumerable<Notice> notices) => notices.Where(a => a.Stage == "pendingAdd").ToLookup(a => (a.Id, a.SetupHash));
+    public static bool AwaitingReadd(Notice removal, ILookup<(string? Id, string Setup), Notice> pending) => removal.ReaddObservedAt is not null || !removal.Quiet && pending[(removal.Id, removal.SetupHash)].Any(a => a.QueuedAt >= removal.FirstSeenAt && a.QueuedAt - removal.FirstSeenAt < MoveWindow);
     public static bool Audible(Notice n, long now) => n.Origin == "live" && !n.Quiet && now - n.FirstSeenAt <= 1800 && n.FirstSeenAt <= now + 120;
     public static bool Ready(string type, bool providers, bool refreshed, long queuedAt, long now) =>
         now - queuedAt >= 900 || refreshed && (type is "Book" or "AudioBook" || providers);

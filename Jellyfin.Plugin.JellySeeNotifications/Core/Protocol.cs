@@ -51,6 +51,7 @@ public sealed record Notice
     public string? OutageId { get; init; }
     public string? Profile { get; init; }
     public string? PresentationKey { get; init; }
+    public long? ReaddObservedAt { get; init; }
     public long HoldUntil { get; init; }
     public bool HoldForScan { get; init; }
     [System.Text.Json.Serialization.JsonConverter(typeof(AudienceConverter))]

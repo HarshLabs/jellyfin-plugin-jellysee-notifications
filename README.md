@@ -83,8 +83,9 @@ Logs contain fixed codes, exception type and HResult only; diagnostics contain
 UTC, monotonic time and fixed cause codes, with a 256 KiB cap and independent I/O.
 Runtime health and counters are separate from saved configuration.
 
-New state lives under `v4/`; migration keeps the old journal/snapshot untouched
-for downgrade and treats missing provenance as recovery. Re-upgrade resumes v4.
+New state lives under `v5/`; migration imports a completed `v4/` first, preserving
+live provenance, or imports the legacy files as recovery. Both predecessors stay
+untouched for downgrade. Re-upgrade resumes v5.
 See [storage details](docs/state-storage.md) for containment, atomic replacement,
 recovery and residual filesystem limits.
 

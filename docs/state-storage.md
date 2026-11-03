@@ -100,8 +100,10 @@ and HResult only. A successful complete iteration resets retry backoff. One
 supervisor-owned monotonic limiter caps all heartbeat attempts at twelve/hour
 and honors relay backoff across worker sessions.
 
-Production writes format-v4 state below `v4/`. Import validates copies of the old
-files and keeps those originals unchanged for downgrade. The migration marker is
+Production writes state below `v5/` using the existing binary container and JSON
+records for optional add obligations. Import prefers a completed `v4/`, preserving
+its provenance, and otherwise imports legacy files as recovery. Both source
+directories remain unchanged for downgrade. The migration marker is
 published only after a complete imported snapshot. See the reliability plan's
 Decisions for the downgrade/re-upgrade workflow.
 

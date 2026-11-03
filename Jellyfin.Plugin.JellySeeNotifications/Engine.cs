@@ -55,13 +55,52 @@ public sealed class Engine
             Drop(Oldest(outbox).EventId);
         journal.Commit(new Change() { Kind = "notice", Notice = notice });
     }
+    private void PutRestoredAdd(Notice original, Notice hint)
+    {
+        // Both are pending adds. Publish one transaction so replay sees both or neither.
+        string[] protectedIds = [original.EventId, hint.EventId];
+        int needed = protectedIds.Count(id => !State.Notices.TryGetValue(id, out var n) || n.Stage == "outbox");
+        int excess = Math.Max(0, State.Notices.Values.Count(n => n.Stage != "outbox") + needed - State.Capacity);
+        var victims = State.Notices.Values.Where(n => n.Stage != "outbox" && !protectedIds.Contains(n.EventId))
+            .OrderBy(n => n.Folded || n.EnqueuedSeq <= State.Health.QuietThroughSeq ? 0 : 1).ThenBy(n => n.QueuedAt).Take(excess).ToArray();
+        List<Change> changes = [];
+        foreach (var victim in victims) { CancelNotice(victim.EventId); changes.Add(new() { Kind = "retire", Key = victim.EventId }); }
+        if (victims.Length != 0) changes.Add(new() { Kind = "health", Health = State.Health with { Dropped = State.Health.Dropped + victims.Length } });
+        changes.Add(new() { Kind = "notice", Notice = original });
+        changes.Add(new() { Kind = "notice", Notice = hint with { EnqueuedSeq = State.Seq + 1 } });
+        journal.Commit(changes.ToArray());
+    }
     public int Life(string id) => Math.Max(State.Lifecycles.GetValueOrDefault(id), State.Index.TryGetValue(id, out var title) ? title.Life : 0);
+    internal void ObserveReadd(string id, long at, string setup)
+    {
+        foreach (var removal in State.Notices.Values.Where(n => n.Op == "rm" && n.Stage == "pendingRemove" && n.Id == id && n.SetupHash == setup && n.ReaddObservedAt is null && at >= n.FirstSeenAt && at - n.FirstSeenAt < Rules.MoveWindow).ToArray())
+            Put(removal with { ReaddObservedAt = at });
+    }
+    internal void ReleaseObservedReadd(string id, long at, string setup)
+    {
+        foreach (var removal in State.Notices.Values.Where(n => n.Op == "rm" && n.Id == id && n.SetupHash == setup && n.ReaddObservedAt is { } observed && observed <= at).ToArray())
+            Put(removal with { ReaddObservedAt = null });
+    }
     public void QueueAdd(string id, string type, string eventId, long now, string setup, string origin = "live", bool folded = false)
     {
         if (State.Notices.Values.Any(n => n.Op == "add" && n.Id == id && n.Life == Life(id))) return;
-        var notice = new Notice { EventId = eventId, Id = id, Type = type, QueuedAt = now, Life = Life(id), SetupHash = setup, Origin = origin, FirstSeenAt = now, Quiet = folded, Folded = folded };
-        Put(notice);
-        if (origin == "recovery" || folded)
+        ObserveReadd(id, now, setup);
+        // Jellyfin IDs derive from type + path. A same-ID callback is the same file,
+        // even if scan churn changed the provider metadata or advanced its lifecycle.
+        State.Tombstones.TryGetValue(id, out var tomb);
+        bool indexed = State.Index.ContainsKey(id);
+        bool readd = indexed || tomb is not null && now - tomb.At < 86400 ||
+            State.Additions.TryGetValue(id, out var addition) && now - addition.At < 86400;
+        // Preserve the original, still-unacknowledged live add; this is its retry, not a new
+        // re-add announcement. Keeping e also lets the relay deduplicate a lost acknowledgement.
+        var owed = !indexed && tomb is not null && now - tomb.At < 86400 && tomb.UnannouncedAdd?.SetupHash == setup ? tomb.UnannouncedAdd : null;
+        var notice = new Notice { EventId = owed?.EventId ?? eventId, Id = id, Type = type, QueuedAt = now, Life = Life(id), SetupHash = setup, Origin = owed is null ? origin : "live", FirstSeenAt = owed?.FirstSeenAt ?? now, Quiet = folded || owed is null && readd, Folded = folded && (owed is not null || !readd), OutageId = owed?.OutageId, EnqueuedSeq = owed?.EnqueuedSeq ?? 0 };
+        if (owed is null) Put(notice);
+        else
+            // Always repair membership separately: callback receipt time cannot prove whether
+            // a removal drained while its metadata read was pending. The original retry stays idempotent.
+            PutRestoredAdd(notice, notice with { EventId = eventId == notice.EventId ? Identity.EventId() : eventId, Origin = origin, FirstSeenAt = now, Quiet = true, Folded = false, OutageId = null });
+        if (!readd && (origin == "recovery" || folded))
         {
             try
             {
@@ -107,11 +146,18 @@ public sealed class Engine
     public void Remove(string id, string eventId, long now, string setup, string origin = "live", bool quiet = false)
     {
         // Duplicate descendant/root-reconcile removals do not advance a lifecycle twice.
-        if (!State.Index.TryGetValue(id, out var title) && State.Tombstones.ContainsKey(id) && !State.Notices.Values.Any(n => n.Id == id && n.Op == "add" && n.Life == Life(id))) return;
+        bool indexed = State.Index.TryGetValue(id, out var title);
+        var observed = State.Notices.Values.FirstOrDefault(n => n.Op == "rm" && n.Id == id && n.SetupHash == setup && n.ReaddObservedAt is not null);
+        if (title is null && State.Tombstones.ContainsKey(id) && observed is null && !State.Notices.Values.Any(n => n.Id == id && n.Op == "add" && n.Life == Life(id))) return;
+        // A final delete can supersede a re-add whose first metadata read never completed.
+        if (title is null && observed is not null) title = new(id, observed.Type!, observed.Folders, observed.ProviderDigest, State.Seq, Life(id));
         int life = checked(Life(id) + 1);
         if (State.Tombstones.Count >= State.IndexCapacity && !State.Tombstones.ContainsKey(id))
             journal.Commit(new Change() { Kind = "untombstone", Key = State.Tombstones.Values.MinBy(t => t.At)!.Id });
-        var tomb = new Tombstone(id, State.Seq + 1, now, life);
+        var original = State.Notices.Values.FirstOrDefault(n => n.Id == id && n.Op == "add" && n.SetupHash == setup && n.Origin == "live" && !n.Quiet && !n.Folded);
+        var obligation = original is not null ? new AddObligation(original.EventId, original.FirstSeenAt, original.SetupHash, original.OutageId, original.EnqueuedSeq) :
+            !indexed && State.Tombstones.TryGetValue(id, out var previous) && now - previous.At < 86400 && previous.UnannouncedAdd?.SetupHash == setup ? previous.UnannouncedAdd : null;
+        var tomb = new Tombstone(id, State.Seq + 1, now, life, obligation);
         Notice? removal = title is null ? null : new()
         {
             EventId = eventId, Op = "rm", Stage = "pendingRemove", Id = id, Type = title.Type,
@@ -121,6 +167,8 @@ public sealed class Engine
             Drop(Oldest(false).EventId);
         List<Change> changes = [new() { Kind = "remove", Tombstone = tomb }];
         if (removal is not null) changes.Add(new() { Kind = "notice", Notice = removal });
+        foreach (var prior in State.Notices.Values.Where(n => n.Id == id && n.Op == "rm" && n.SetupHash == setup && n.ReaddObservedAt is not null).ToArray())
+        { CancelNotice(prior.EventId); changes.Add(new() { Kind = "retire", Key = prior.EventId }); }
         foreach (var pending in State.Notices.Values.Where(n => n.Id == id && n.Op == "add" && n.Life < life).ToArray())
         { CancelNotice(pending.EventId); changes.Add(new() { Kind = "retire", Key = pending.EventId }); }
         // Tombstone, occurrence and retirement of the old pending addition are one durable transition.
@@ -135,7 +183,7 @@ public sealed class Engine
             try
             {
                 var item = source.Read(n.Id!, n.FirstSeenAt, now);
-                if (item is null) { Retire(n.EventId); continue; }
+                if (item is null) { Retire(n.EventId); ReleaseObservedReadd(n.Id!, n.QueuedAt, n.SetupHash); continue; }
                 // Fingerprint a discovered replacement before readiness can delay it.
                 var description = item.Title;
                 if (n.ProviderDigest != description.ProviderDigest || !n.Folders.SequenceEqual(description.Folders))
@@ -147,7 +195,7 @@ public sealed class Engine
                 if (!State.Additions.TryGetValue(n.Id!, out var previous) || previous.At != fingerprint.At || previous.SetupHash != fingerprint.SetupHash ||
                     previous.Type != fingerprint.Type || previous.ProviderDigest != fingerprint.ProviderDigest || !previous.Folders.SequenceEqual(fingerprint.Folders))
                     journal.Commit(new Change() { Kind = "addition", Addition = fingerprint });
-                var removal = State.Notices.Values.FirstOrDefault(r => r.Op == "rm" && Rules.Upgrade(r, fingerprint));
+                var removal = State.Notices.Values.FirstOrDefault(r => r.Op == "rm" && r.Id != n.Id && Rules.Upgrade(r, fingerprint));
                 bool quiet = n.Quiet || removal is not null;
                 if (removal is not null)
                 {
@@ -169,8 +217,21 @@ public sealed class Engine
                 if (!n.Folded && !quiet && duplicate && (n.HoldForScan ? source.ScanRunning && now < n.HoldUntil : now < n.FirstSeenAt + Rules.MoveWindow)) continue;
                 if ((!quiet || n.Folded) && !Rules.Audible(n, now))
                 { RecoverAddition(n, now); n = State.Notices[n.EventId]; }
-                if (!item.Ready && !n.Folded && now - n.FirstSeenAt < 900) continue;
+                // A proven same-file re-add needs no new-title metadata delay. Index it and
+                // cancel the held removal before the ten-minute removal timer can expire.
+                bool sameFile = State.Tombstones.TryGetValue(n.Id!, out var dead) && n.QueuedAt - dead.At < 86400 &&
+                    (n.Quiet || dead.UnannouncedAdd?.EventId == n.EventId) || n.Quiet && State.Index.ContainsKey(n.Id!);
+                if (!item.Ready && !n.Folded && !sameFile && now - n.FirstSeenAt < 900) continue;
                 Index(description);
+                // Keep removal metadata until the replacement is actually indexed: a second remove
+                // while metadata is pending must still have a removal to deliver.
+                if (State.Index.ContainsKey(n.Id!))
+                    foreach (var held in State.Notices.Values.Where(r => r.Op == "rm" && r.Stage == "pendingRemove" && r.Id == n.Id && r.SetupHash == n.SetupHash && n.QueuedAt >= r.FirstSeenAt && n.QueuedAt - r.FirstSeenAt < Rules.MoveWindow).ToArray())
+                    {
+                        var departed = held.Folders.Except(description.Folders).ToArray();
+                        if (departed.Length == 0) Retire(held.EventId);
+                        else Put(held with { Folders = departed, Quiet = true, ReaddObservedAt = null });
+                    }
                 var audience = source.Audience(n.Id, description.Folders, now);
                 if (audience.Length == 0)
                 {
@@ -187,7 +248,31 @@ public sealed class Engine
     }
     public void AdvanceRemovals(long now, Action<string> error)
     {
-        var pending = State.Notices.Values.Where(n => n.Stage == "pendingRemove").OrderBy(n => n.QueuedAt).ToArray();
+        // A re-add observed during the hold cancels removal presentation even if its
+        // asynchronous metadata read is still pending. Keep the metadata for a final delete.
+        // Callback receipt can precede its first metadata read. Resume that durable work after
+        // restart instead of retaining a hold whose in-memory signal no longer exists.
+        var queuedReadds = Rules.PendingReadds(State.Notices.Values);
+        foreach (var orphan in State.Notices.Values.Where(n => n.Op == "rm" && n.Stage == "pendingRemove" && n.ReaddObservedAt is not null && !queuedReadds[(n.Id, n.SetupHash)].Any()).ToArray())
+        {
+            if (!BudgetAvailable()) { WorkPending = true; return; }
+            try
+            {
+                var item = source.Read(orphan.Id!, orphan.ReaddObservedAt!.Value, now);
+                if (item is null) ReleaseObservedReadd(orphan.Id!, orphan.ReaddObservedAt.Value, orphan.SetupHash);
+                else
+                {
+                    QueueAdd(orphan.Id!, item.Title.Type, Identity.EventId(), orphan.ReaddObservedAt.Value, orphan.SetupHash, "recovery");
+                    AdvanceAdds(now, error, orphan.Id);
+                }
+            }
+            catch (LibraryPendingException) { WorkPending = true; }
+            catch (LibraryCallException) { error("requiredCallTimeout"); }
+            catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException or StatePersistenceException)) { error("itemEvaluationFailed"); }
+        }
+        var readdHolds = Rules.PendingReadds(State.Notices.Values);
+        bool AwaitingReadd(Notice removal) => Rules.AwaitingReadd(removal, readdHolds);
+        var pending = State.Notices.Values.Where(n => n.Stage == "pendingRemove" && !AwaitingReadd(n)).OrderBy(n => n.QueuedAt).ToArray();
         // Pending fingerprints also survive history eviction while readiness is
         // delayed; they have their own bounded queue and persisted occurrence time.
         var replacements = State.Additions.Values.Concat(State.Notices.Values.Where(n => n.Stage == "pendingAdd")
@@ -204,7 +289,7 @@ public sealed class Engine
         {
             string folder = route.Folder;
             if (!BudgetAvailable()) { WorkPending = true; break; }
-            var candidates = State.Notices.Values.Where(n => n.Stage == "pendingRemove" && n.SetupHash == route.Setup && n.Origin == route.Origin && n.Quiet == route.Quiet && n.Folders.Contains(folder)).OrderBy(n => n.QueuedAt).ToArray();
+            var candidates = State.Notices.Values.Where(n => n.Stage == "pendingRemove" && !AwaitingReadd(n) && n.SetupHash == route.Setup && n.Origin == route.Origin && n.Quiet == route.Quiet && n.Folders.Contains(folder)).OrderBy(n => n.QueuedAt).ToArray();
             if (candidates.Length == 0) continue;
             long start = candidates[0].QueuedAt;
             var window = candidates.Where(n => n.QueuedAt <= start + 600).ToArray();
@@ -220,7 +305,7 @@ public sealed class Engine
                 };
                 // A compact, deterministic rewrite consumes the complete window atomically.
                 EnsureOutboxSlot();
-                journal.Commit(new Change() { Kind = "bulk", Notice = bulk, Key = (start + 600).ToString(System.Globalization.CultureInfo.InvariantCulture) }, new() { Kind = "life", Lifecycle = new(folder, bulk.Life) });
+                journal.Commit(new Change() { Kind = "bulk", ExcludePendingReadds = true, Notice = bulk, Key = (start + 600).ToString(System.Globalization.CultureInfo.InvariantCulture) }, new() { Kind = "life", Lifecycle = new(folder, bulk.Life) });
                 if (audience.Length == 0) Drop(bulk.EventId);
             }
             catch (LibraryPendingException) { WorkPending = true; }
@@ -228,13 +313,13 @@ public sealed class Engine
             catch (TooManyUsersException) { error("tooManyUsers"); return; }
             catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException or StatePersistenceException)) { error("itemEvaluationFailed"); }
         }
-        foreach (var n in State.Notices.Values.Where(n => n.Stage == "pendingRemove" && now >= n.QueuedAt + 600).ToArray())
+        foreach (var n in State.Notices.Values.Where(n => n.Stage == "pendingRemove" && !AwaitingReadd(n) && now >= n.QueuedAt + 600).ToArray())
         {
             if (!BudgetAvailable()) { WorkPending = true; break; }
             // If still accumulating toward a bulk window, wait until its newest member's hold ends.
             if (n.Folders.Any(f =>
             {
-                var peers = State.Notices.Values.Where(p => p.Stage == "pendingRemove" && p.SetupHash == n.SetupHash && p.Origin == n.Origin && p.Quiet == n.Quiet && p.Folders.Contains(f) && p.QueuedAt >= n.QueuedAt && p.QueuedAt <= n.QueuedAt + 600).ToArray();
+                var peers = State.Notices.Values.Where(p => p.Stage == "pendingRemove" && !AwaitingReadd(p) && p.SetupHash == n.SetupHash && p.Origin == n.Origin && p.Quiet == n.Quiet && p.Folders.Contains(f) && p.QueuedAt >= n.QueuedAt && p.QueuedAt <= n.QueuedAt + 600).ToArray();
                 return peers.Length > 200 && peers.Any(p => now < p.QueuedAt + 600);
             })) continue;
             try

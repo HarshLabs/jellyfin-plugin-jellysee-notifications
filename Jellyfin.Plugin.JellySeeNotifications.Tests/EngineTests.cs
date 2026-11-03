@@ -108,7 +108,8 @@ public sealed class EngineTests
         var fake = new FakeCompat(); fake.Add(1); var engine = new Engine(journal, fake, "key");
         engine.Index(fake.Get(Id(1))!); engine.Remove(Id(1), Id(100), 1000, "");
         fake.Folders = [Id(9)]; engine.QueueAdd(Id(1), "Movie", Id(101), 1001, ""); engine.AdvanceAdds(1002, _ => { }); engine.AdvanceRemovals(1600, _ => { });
-        Assert.Equal(2, journal.State.Notices.Count); Assert.Contains(journal.State.Notices.Values, n => n.Op == "rm" && n.Stage == "outbox");
+        Assert.Equal(2, journal.State.Notices.Count); Assert.All(journal.State.Notices.Values, n => Assert.True(n.Quiet));
+        Assert.Contains(journal.State.Notices.Values, n => n.Op == "rm" && n.Stage == "outbox" && n.Folders.SequenceEqual(new[] { Id(8) }));
     }
     [Fact] public void MoreThanTwoHundredRemovalsProduceOneBulkPerLibraryAndRecoverAtomically()
     {

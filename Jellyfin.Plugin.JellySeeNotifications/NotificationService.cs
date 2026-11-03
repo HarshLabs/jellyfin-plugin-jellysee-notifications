@@ -394,9 +394,10 @@ public sealed class NotificationService : BackgroundService
                     if (signal.Op == "add")
                     {
                         if (journal.State.Notices.Values.Any(n => n.Op == "add" && n.Id == signal.Id && n.Life == engine.Life(signal.Id))) continue;
+                        engine.ObserveReadd(signal.Id, signal.At, signal.Setup);
                         if (evaluatingAdds.Add(signal.Id)) lanes.Invalidate(signal.Id);
                         var item = lanes.Read(signal.Id, signal.At, now);
-                        if (item is null) continue;
+                        if (item is null) { engine.ReleaseObservedReadd(signal.Id, signal.At, signal.Setup); continue; }
                         if (item.Title.Folders.Length == 0 || !item.Title.Folders.All(signal.Coverage.Contains)) origin = "recovery";
                         engine.QueueAdd(signal.Id, signal.Type!, signal.EventId, signal.At, signal.Setup, origin, signal.ClockEpoch != Interlocked.Read(ref clockEpoch));
                         scan?.Known.Add(signal.Id); queuedAt = Mono; readyRequested = true;
@@ -404,7 +405,9 @@ public sealed class NotificationService : BackgroundService
                     else if (signal.Op == "rm")
                     {
                         removedThrough[signal.Id] = signal.Sequence; lanes.Invalidate(signal.Id); updated.Remove(signal.Id); evaluatingAdds.Remove(signal.Id);
-                        if (!journal.State.Index.TryGetValue(signal.Id, out var title) || title.Folders.Length == 0 || !title.Folders.All(signal.Coverage.Contains)) origin = "recovery";
+                        var removedFolders = journal.State.Index.TryGetValue(signal.Id, out var title) ? title.Folders : journal.State.Notices.Values
+                            .FirstOrDefault(n => n.Op == "rm" && n.Id == signal.Id && n.SetupHash == signal.Setup && n.ReaddObservedAt is not null)?.Folders;
+                        if (removedFolders is null || removedFolders.Length == 0 || !removedFolders.All(signal.Coverage.Contains)) origin = "recovery";
                         engine.Remove(signal.Id, signal.EventId, signal.At, signal.Setup, origin, signal.ClockEpoch != Interlocked.Read(ref clockEpoch)); scan?.Known.Remove(signal.Id); queuedAt = Mono;
                     }
                     else if (signal.Op == "update")

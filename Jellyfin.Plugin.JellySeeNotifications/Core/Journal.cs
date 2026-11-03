@@ -42,19 +42,24 @@ public sealed class Journal : IDisposable
             io.Invoke(() =>
             {
                 string original = directory;
-                if (versioned) directory = Path.Combine(directory, "v4");
+                if (versioned) directory = Path.Combine(directory, "v5");
                 files = new StateDirectory(directory, pluginDataPath ?? Path.GetDirectoryName(Path.GetFullPath(directory))!, io.Token);
                 if (versioned && files.Length("migration.complete") == 0)
                 {
-                    using var source = new StateDirectory(original, pluginDataPath ?? Path.GetDirectoryName(Path.GetFullPath(original))!, io.Token);
+                    string migrationSource = original;
+                    string previous = Path.Combine(original, "v4");
+                    using (var prior = new StateDirectory(previous, pluginDataPath ?? Path.GetDirectoryName(Path.GetFullPath(original))!, io.Token))
+                        if (prior.Length("migration.complete") != 0) migrationSource = previous;
+                    using var source = new StateDirectory(migrationSource, pluginDataPath ?? Path.GetDirectoryName(Path.GetFullPath(original))!, io.Token);
                     foreach (string name in new[] { "snapshot.bin", "journal.ndjson" })
                     {
                         using var old = source.Read(name);
                         if (old is not null) { if (old.Length > MaxFile) throw new InvalidDataException("Migration cap"); using var copy = files.Rewrite(name, old, old.Length); }
                     }
-                    // Publish only after a complete imported snapshot. A failed import is retried from untouched v3 files.
+                    // Publish only after a complete imported snapshot. A failed import is retried from untouched predecessor files.
                     Load();
-                    foreach (var n in State.Notices.Values.ToArray()) State.Apply(new() { Kind = "notice", Notice = n with { Origin = "recovery", FirstSeenAt = n.FirstSeenAt == 0 ? n.QueuedAt : n.FirstSeenAt } });
+                    if (migrationSource == original)
+                        foreach (var n in State.Notices.Values.ToArray()) State.Apply(new() { Kind = "notice", Notice = n with { Origin = "recovery", FirstSeenAt = n.FirstSeenAt == 0 ? n.QueuedAt : n.FirstSeenAt } });
                     CompactCore();
                     using var marker = files.Rewrite("migration.complete", null, 0); marker.WriteByte(1); marker.Flush(true);
                 }
@@ -226,7 +231,7 @@ public sealed class Journal : IDisposable
             foreach (var c in State.Snapshot())
             {
                 io.Token.ThrowIfCancellationRequested();
-                byte kind = c.Kind == "title" ? (byte)1 : c.Kind == "remove" ? (byte)2 : c.Kind == "life" ? (byte)3 : (byte)0;
+                byte kind = c.Kind == "title" ? (byte)1 : c.Kind == "remove" && c.Tombstone!.UnannouncedAdd is null ? (byte)2 : c.Kind == "life" ? (byte)3 : (byte)0;
                 byte[] bytes = kind == 1 ? CompactCodec.Encode(c.Title!) : kind == 2 ? CompactCodec.Encode(c.Tombstone!) : kind == 3 ? CompactCodec.Encode(c.Lifecycle!) : Encode(new Entry(State.Seq, [c]));
                 output.WriteByte(kind); digest.AppendData([kind]);
                 if (kind == 0)
