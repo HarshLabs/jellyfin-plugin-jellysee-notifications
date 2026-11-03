@@ -9,7 +9,7 @@ namespace Jellyfin.Plugin.JellySeeNotifications.Tests;
 public sealed class ProtocolTests
 {
     internal static string Id(int i) => i.ToString("x32");
-    internal static Notice Event(int i = 1) => new() { EventId = Id(i), Id = Id(i + 100), Type = "Movie", QueuedAt = 100, At = 200, Stage = "outbox" };
+    internal static Notice Event(int i = 1) => new() { EventId = Id(i), Id = Id(i + 100), Type = "Movie", Origin = "live", QueuedAt = 100, At = 200, Stage = "outbox" };
     [Fact] public void SharedHashVectorsPreserveServerPunctuation()
     {
         Assert.Equal("s1-ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", Identity.ServerKey(" ABC "));
@@ -51,7 +51,7 @@ public sealed class ProtocolTests
                 "rmbulk" => ["a", "at", "count", "e", "f", "life", "op"],
                 _ => ["at", "e", "f", "life", "op"]
             };
-            Assert.Equal(expected, item.EnumerateObject().Select(p => p.Name).Order());
+            Assert.Equal(expected.Concat(new[] { "firstSeenAt", "origin" }).Order(), item.EnumerateObject().Select(p => p.Name).Order());
         }
     }
     [Fact] public void AcknowledgementsAreStrictAndIntersectRequest()

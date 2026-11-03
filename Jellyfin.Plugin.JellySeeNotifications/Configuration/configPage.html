@@ -11,6 +11,7 @@
 <div class="fieldDescription">Write only. Leave blank to keep the configured secret. Use the same secret as JellySee's Webhook integration.</div></div>
 <div class="checkboxContainer"><label><input is="emby-checkbox" type="checkbox" id="ClearSecret"><span>Clear the configured secret</span></label></div>
 <p id="Status" role="status"></p>
+<details><summary>Diagnostics</summary><pre id="Diagnostics"></pre></details>
 <button is="emby-button" type="submit" class="raised button-submit block"><span>Save</span></button>
 </form></div></div>
 <script>
@@ -24,9 +25,12 @@
             page.querySelector('#Enabled').checked = config.Enabled;
             page.querySelector('#Secret').value = '';
             page.querySelector('#ClearSecret').checked = false;
-            page.querySelector('#Status').textContent = 'Status: ' + config.Status + '. Indexed: ' + config.IndexCount +
-                '. Outbox: ' + config.OutboxDepth + '. Baseline libraries remaining: ' + config.BaselineLibrariesRemaining +
-                (config.IndexFull ? '. Index full: addition recovery is off.' : '') + (config.TooManyUsers ? '. More than 2,000 users: sender paused.' : '');
+            ApiClient.getJSON(ApiClient.getUrl('JellySeeNotifications/Diagnostics')).then(function (runtime) {
+                var s = runtime.status;
+                page.querySelector('#Status').textContent = 'Status: ' + runtime.health + ' (' + s.ErrorCode + '). Indexed: ' + s.IndexCount +
+                    '. Outbox: ' + s.OutboxDepth + '. Baseline libraries remaining: ' + s.BaselineLibrariesRemaining;
+                page.querySelector('#Diagnostics').textContent = runtime.causes.map(function (entry) { return entry.Utc + ' ' + entry.Cause; }).join('\n');
+            });
             Dashboard.hideLoadingMsg();
         }).catch(function () { Dashboard.hideLoadingMsg(); Dashboard.alert('Could not load configuration.'); });
     });

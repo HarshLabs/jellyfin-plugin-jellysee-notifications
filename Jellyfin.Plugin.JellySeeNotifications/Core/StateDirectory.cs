@@ -10,7 +10,7 @@ internal sealed class StateDirectory : IDisposable
     private readonly string relative;
     private readonly CancellationToken ct;
     private static StringComparison PathComparison => OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
-    private static readonly string[] TempPrefixes = ["snapshot.tmp.", "journal.ndjson.tmp.", "snapshot.bin.corrupt.tmp."];
+    private static readonly string[] TempPrefixes = ["snapshot.tmp.", "journal.ndjson.tmp.", "snapshot.bin.corrupt.tmp.", "migration.complete.tmp.", "diagnostics.ndjson.tmp."];
     internal const int RecoveryLimit = 128;
 
     internal StateDirectory(string path, string pluginDataPath, CancellationToken ct = default)

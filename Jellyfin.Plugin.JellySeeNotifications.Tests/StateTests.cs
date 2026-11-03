@@ -33,14 +33,14 @@ public sealed class StateTests
         Assert.False(Rules.AudienceExpired(Event() with { QueuedAt = 100 }, 1899));
         Assert.True(Rules.Expired(Event(), 86500));
     }
-    [Fact] public void UpgradeRequiresNonemptyDigestAndExactlySameFoldersAndType()
+    [Fact] public void MoveMatchRequiresNonemptyDigestTypeSetupAndWindow()
     {
         var rm = Event() with { Op = "rm", Folders = [Id(8), Id(9)], ProviderDigest = "1234567890abcdef", QueuedAt = 1000 };
         var add = new Addition(Id(2), "Movie", [Id(9), Id(8)], rm.ProviderDigest, 1600);
         Assert.True(Rules.Upgrade(rm, add));
         Assert.False(Rules.Upgrade(rm, add with { At = 1601 }));
         Assert.False(Rules.Upgrade(rm with { ProviderDigest = null }, add with { ProviderDigest = null }));
-        Assert.False(Rules.Upgrade(rm, add with { Folders = [Id(8)] }));
+        Assert.True(Rules.Upgrade(rm, add with { Folders = [Id(8)] }));
         Assert.False(Rules.Upgrade(rm, add with { Type = "Book" }));
     }
     [Theory]
@@ -140,7 +140,7 @@ public sealed class StateTests
     {
         var state = new State(); state.Apply(new() { Kind = "notice", Notice = Event() });
         using var json = JsonDocument.Parse(Heartbeat.Encode("server", state, 1000, "none", false, 100));
-        Assert.Equal(new[] { "baselineLibrariesRemaining", "droppedSinceLast", "errorCode", "indexCount", "indexFull", "lastAckAt", "oldestPendingAgeS", "outboxDepth", "server", "stateBytes", "tooManyUsers", "v", "version" }, json.RootElement.EnumerateObject().Select(p => p.Name).Order());
+        Assert.Equal(new[] { "adminUserHashes", "baselineLibrariesRemaining", "bindings", "bootId", "droppedSinceLast", "errorCode", "indexCount", "indexFull", "lastAckAt", "leaseSeconds", "oldestPendingAgeS", "outboxDepth", "progressAge", "requiredCallStuck", "restartRequired", "server", "stateBytes", "storageUnavailable", "tooManyUsers", "uncoveredAge", "v", "version" }, json.RootElement.EnumerateObject().Select(p => p.Name).Order());
         using var temp = new TempDirectory();
         using var journal = new Journal(temp.Path); journal.Commit(new Change { Kind = "notice", Notice = Event() }); journal.Compact();
         string disk = File.ReadAllText(System.IO.Path.Combine(temp.Path, "snapshot.bin"));

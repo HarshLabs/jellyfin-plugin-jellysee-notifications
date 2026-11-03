@@ -13,6 +13,9 @@ using Jellyfin.Plugin.JellySeeNotifications.Core;
 
 namespace Jellyfin.Plugin.JellySeeNotifications;
 
+public sealed record LibraryRoot(string Id, string Path);
+public sealed record InventoryView(Library[] Libraries, LibraryRoot[] Roots);
+
 public interface IJellyfinCompat
 {
     BaseItem? Get(string id);
@@ -22,8 +25,10 @@ public interface IJellyfinCompat
     bool Ready(BaseItem item, long queuedAt, long now);
     string? Series(BaseItem item);
     string[] Users(string serverKey);
+    string[] AdminUserHashes(string serverKey) => [];
     string[] Audience(BaseItem? item, string[] folders, string serverKey);
     Library[] Inventory();
+    InventoryView ReadInventory() => new(Inventory(), []);
     IReadOnlyList<Guid> Ids(string libraryId);
 }
 
@@ -61,6 +66,7 @@ public sealed class JellyfinCompat(ILibraryManager library, IUserManager users, 
         return result;
     }
     public string[] Users(string serverKey) => BoundedUsers().Select(u => Identity.UserHash(serverKey, u.Id)).Order(StringComparer.Ordinal).ToArray();
+    public string[] AdminUserHashes(string serverKey) => BoundedUsers().Where(u => !u.HasPermission(PermissionKind.IsDisabled) && u.HasPermission(PermissionKind.IsAdministrator)).Select(u => Identity.UserHash(serverKey, u.Id)).Order(StringComparer.Ordinal).Take(65).ToArray();
     public string[] Audience(BaseItem? item, string[] folders, string key)
     {
         var routes = item is not null ? library.GetCollectionFolders(item).OfType<CollectionFolder>().ToArray() :
@@ -70,7 +76,8 @@ public sealed class JellyfinCompat(ILibraryManager library, IUserManager users, 
             (item is null || item.IsVisibleStandalone(u)) && routes.Any(f => f.IsVisible(u)))
             .Select(u => Identity.UserHash(key, u.Id)).Order(StringComparer.Ordinal).ToArray();
     }
-    public Library[] Inventory()
+    public Library[] Inventory() => ReadInventory().Libraries;
+    public InventoryView ReadInventory()
     {
         string root = paths.DefaultUserViewsPath;
         // EnumerationOptions defaults must not silently skip inaccessible entries.
@@ -79,17 +86,19 @@ public sealed class JellyfinCompat(ILibraryManager library, IUserManager users, 
         var virtualFolders = library.GetVirtualFolders();
         if (directories.Length != virtualFolders.Count || directories.Length > 2000) throw new IOException("Incomplete library inventory");
         List<Library> inventory = [];
+        List<LibraryRoot> roots = [];
         foreach (var dir in directories)
         {
             var info = virtualFolders.SingleOrDefault(f => string.Equals(f.Name, Path.GetFileName(dir), StringComparison.Ordinal)) ?? throw new IOException("Incomplete library inventory");
             int links = Directory.GetFiles(dir, "*", options).Count(p => Path.GetExtension(p).Equals(".mblink", StringComparison.OrdinalIgnoreCase));
             if (info.Locations is null || links != info.Locations.Length || info.Locations.Length > 1024) throw new IOException("Incomplete library locations");
             string logicalId = Guid.TryParse(info.ItemId, out var id) ? id.ToString("N") : "";
+            foreach (string location in info.Locations) roots.Add(new(logicalId, location));
             inventory.Add(new(Identity.Hash(Path.GetFileName(dir)), logicalId, info.Locations.Select(Identity.Hash).Order().ToArray(), info.LibraryOptions?.Enabled ?? true, false));
         }
         // Detect a mutation during either enumeration; never mistake a partial poll for a deletion.
         if (!directories.Order().SequenceEqual(Directory.GetDirectories(root, "*", options).Order())) throw new IOException("Unstable library inventory");
-        return inventory.ToArray();
+        return new(inventory.ToArray(), roots.ToArray());
     }
     public IReadOnlyList<Guid> Ids(string libraryId)
     {

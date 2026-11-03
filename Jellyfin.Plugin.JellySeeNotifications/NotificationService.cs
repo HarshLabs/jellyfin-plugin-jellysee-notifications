@@ -1,9 +1,10 @@
-using System.Text.Json;
+using System.Collections.Immutable;
 using System.Threading.Channels;
 using Jellyfin.Plugin.JellySeeNotifications.Core;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
+using MediaBrowser.Model.Tasks;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -16,346 +17,569 @@ public sealed class NotificationService : BackgroundService
     private readonly IServerApplicationHost host;
     private readonly RelayClient relay;
     private readonly ILogger<NotificationService> logger;
-    private readonly Channel<Signal> channel;
     private readonly Func<PluginConfiguration> configuration;
     private readonly Func<(string Directory, string Root)> statePaths;
     private readonly TimeSpan stateIoTimeout;
     private readonly Func<TimeSpan, CancellationToken, Task> stateRetryDelay;
     private readonly TimeProvider timeProvider;
-    private long channelDropped;
-    private bool enabled;
+    private readonly LibraryLanes lanes;
+    private readonly Func<string, string, CancellationToken, StateOwnership, Journal> openJournal;
+    private readonly DiagnosticsRing diagnostics;
+    private readonly HeartbeatLimiter limiter;
+    private readonly Channel<Signal> channel;
+    private readonly Channel<BindWork> bindQueue = Channel.CreateBounded<BindWork>(64);
+    private readonly object coverageGate = new();
+    private long coverageEpoch;
+    private ImmutableArray<LibraryRoot> libraryRoots = [];
+    private readonly Dictionary<string, int> signalledAdds = new(StringComparer.Ordinal);
+    private ImmutableHashSet<string> covered = ImmutableHashSet<string>.Empty;
+    private RuntimeSnapshot snapshot;
+    private AdminSnapshot admins = new([], 0);
+    private RuntimeSnapshot CurrentSnapshot()
+    {
+        var s = Volatile.Read(ref snapshot); var a = Volatile.Read(ref admins);
+        return s with { AdminUserHashes = a.Hashes, AdminStamp = a.At, TooManyUsers = s.TooManyUsers || a.TooManyUsers, ErrorCode = s.ErrorCode == "none" ? a.ErrorCode : s.ErrorCode };
+    }
+    internal RuntimeSnapshot Snapshot => CurrentSnapshot();
+    internal Task DiagnosticsStopped => diagnostics.Completion;
+    internal ImmutableHashSet<string> CoveredLibraries => Volatile.Read(ref covered);
     private string setupHash = "";
+    private long signalSequence;
+    private long channelDropped;
+    private long reportedDroppedTotal;
+    private bool enabled;
     private string error = "none";
     private bool tooManyUsers;
-    private sealed record Signal(string Op, string Id, string? Type, string EventId, long At, string Setup, string? ParentId = null);
-    private static long Now => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-    public NotificationService(ILibraryManager library, IJellyfinCompat compat, IServerApplicationHost host, RelayClient relay, ILogger<NotificationService> logger)
+    private sealed record UtcAnchor(long Utc, long Stamp);
+    private UtcAnchor utcAnchor;
+    private long clockEpoch;
+    private sealed record ClockCorrection(string Id, long Fence, Dictionary<string, (string Id, long Cutoff)> Recoveries);
+    private ClockCorrection? pendingClockCorrection;
+    private long Now { get { var anchor = Volatile.Read(ref utcAnchor); return anchor.Utc + (long)timeProvider.GetElapsedTime(anchor.Stamp).TotalSeconds; } }
+    private long WallNow => timeProvider.GetUtcNow().ToUnixTimeSeconds();
+    private long Mono => timeProvider.GetTimestamp();
+    private sealed record Signal(string Op, string Id, string? Type, string EventId, long At, string Setup, ImmutableHashSet<string> Coverage, long Sequence, string Origin, long ClockEpoch);
+    private sealed record BindWork(Binding Binding, TaskCompletionSource<bool> Completion);
+
+    public NotificationService(ILibraryManager library, IJellyfinCompat compat, IServerApplicationHost host, RelayClient relay, ILogger<NotificationService> logger, ITaskManager tasks)
         : this(library, compat, host, relay, logger,
             () => (Plugin.Instance ?? throw new InvalidOperationException()).Configuration,
             () => { var plugin = Plugin.Instance ?? throw new InvalidOperationException(); return (plugin.DataFolderPath, plugin.StateRootPath); },
-            StateIoWorker.DefaultTimeout) { }
-
+            StateIoWorker.DefaultTimeout, tasks: tasks) { }
     internal NotificationService(ILibraryManager library, IJellyfinCompat compat, IServerApplicationHost host, RelayClient relay, ILogger<NotificationService> logger,
         Func<PluginConfiguration> configuration, Func<(string Directory, string Root)> statePaths, TimeSpan stateIoTimeout,
-        Func<TimeSpan, CancellationToken, Task>? stateRetryDelay = null, TimeProvider? timeProvider = null)
+        Func<TimeSpan, CancellationToken, Task>? stateRetryDelay = null, TimeProvider? timeProvider = null, ITaskManager? tasks = null, Func<string, string, CancellationToken, StateOwnership, Journal>? openJournal = null)
     {
         this.library = library; this.compat = compat; this.host = host; this.relay = relay; this.logger = logger;
         this.configuration = configuration; this.statePaths = statePaths; this.stateIoTimeout = stateIoTimeout;
-        this.stateRetryDelay = stateRetryDelay ?? Task.Delay;
-        this.timeProvider = timeProvider ?? TimeProvider.System;
-        channel = Channel.CreateBounded<Signal>(new BoundedChannelOptions(State.Capacity) { SingleReader = true, FullMode = BoundedChannelFullMode.DropOldest }, _ => Interlocked.Increment(ref channelDropped));
+        this.openJournal = openJournal ?? ((directory, root, token, owner) => new Journal(directory, root, token, stateIoTimeout, owner, versioned: true));
+        this.stateRetryDelay = stateRetryDelay ?? Task.Delay; this.timeProvider = timeProvider ?? TimeProvider.System;
+        utcAnchor = new(this.timeProvider.GetUtcNow().ToUnixTimeSeconds(), Mono);
+        snapshot = new() { ProgressStamp = Mono };
+        lanes = new(compat, Identity.ServerKey(host.SystemId), this.timeProvider, tasks);
+        limiter = new(this.timeProvider); diagnostics = new(statePaths, this.timeProvider);
+        channel = Channel.CreateBounded<Signal>(new BoundedChannelOptions(State.Capacity) { SingleReader = true, FullMode = BoundedChannelFullMode.DropOldest }, lost =>
+        { CompleteSignal(lost); Interlocked.Increment(ref channelDropped); UncoverLibraries(); });
     }
-    private void Added(object? sender, ItemChangeEventArgs e)
+    private void UncoverLibraries(string? folder = null)
     {
-        if (Volatile.Read(ref enabled) && compat.IsTitle(e.Item)) Enqueue("add", e.Item, compat.TitleType(e.Item));
+        lock (coverageGate) { coverageEpoch++; Volatile.Write(ref covered, folder is null ? ImmutableHashSet<string>.Empty : covered.Remove(folder)); }
     }
+    private bool TryCover(string folder, long epoch)
+    {
+        lock (coverageGate)
+        {
+            if (coverageEpoch != epoch || Interlocked.Read(ref channelDropped) != 0) return false;
+            Volatile.Write(ref covered, covered.Add(folder)); return true;
+        }
+    }
+    private void Added(object? sender, ItemChangeEventArgs e) { if (Volatile.Read(ref enabled) && compat.IsTitle(e.Item)) Enqueue("add", e.Item, compat.TitleType(e.Item)); }
     private void Removed(object? sender, ItemChangeEventArgs e)
     {
-        if (Volatile.Read(ref enabled))
-        {
-            // Series is both a title and a container, and must trigger the descendant reconcile.
-            if (compat.TitleType(e.Item) is { } type) Enqueue("rm", e.Item, type, e.Parent?.Id);
-            if (e.Item is Folder) Enqueue("dirty", e.Item, null);
-        }
+        if (!Volatile.Read(ref enabled)) return;
+        if (compat.TitleType(e.Item) is { } type) Enqueue("rm", e.Item, type);
+        if (e.Item is Folder) Enqueue("dirty", e.Item, null);
     }
     private void Updated(object? sender, ItemChangeEventArgs e)
     {
-        if (Volatile.Read(ref enabled))
+        if (!Volatile.Read(ref enabled)) return;
+        if (compat.IsTitle(e.Item)) Enqueue("update", e.Item, compat.TitleType(e.Item));
+        if (e.Item is Folder) Enqueue("dirty", e.Item, null);
+    }
+    private void Enqueue(string op, BaseItem item, string? type)
+    {
+        lock (coverageGate)
         {
-            if (compat.IsTitle(e.Item)) Enqueue("update", e.Item, compat.TitleType(e.Item));
-            if (e.Item is Folder) Enqueue("dirty", e.Item, null);
+            string id = item.Id.ToString("N");
+            if (op == "add") signalledAdds[id] = signalledAdds.GetValueOrDefault(id) + 1;
+            var signal = new Signal(op, id, type, Identity.EventId(), Now, Volatile.Read(ref setupHash), Volatile.Read(ref covered), ++signalSequence, ReceiptOrigin(item.Path), clockEpoch);
+            if (!channel.Writer.TryWrite(signal)) CompleteSignal(signal);
         }
     }
-    private void Enqueue(string op, BaseItem item, string? type, Guid? parentId = null) => channel.Writer.TryWrite(new(op, item.Id.ToString("N"), type, Identity.EventId(), Now, Volatile.Read(ref setupHash), parentId?.ToString("N")));
-    private void SetError(string code) { error = code; if (code == "tooManyUsers") tooManyUsers = true; }
-
+    // Pure in-memory path matching captures the library at receipt without calling Jellyfin.
+    // Roots never enter persistence, wire DTOs, logs or diagnostics.
+    private string ReceiptOrigin(string? path)
+    {
+        if (string.IsNullOrEmpty(path)) return "recovery";
+        string normalized = path.Replace('\\', '/').TrimEnd('/'); bool matched = false;
+        var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        foreach (var root in libraryRoots)
+        {
+            string prefix = root.Path.Replace('\\', '/').TrimEnd('/');
+            if (!normalized.Equals(prefix, comparison) && !normalized.StartsWith(prefix + "/", comparison)) continue;
+            matched = true; if (!covered.Contains(root.Id)) return "recovery";
+        }
+        return matched ? "live" : "recovery";
+    }
+    private void CompleteSignal(Signal signal)
+    {
+        if (signal.Op != "add") return;
+        lock (coverageGate)
+        {
+            if (!signalledAdds.TryGetValue(signal.Id, out int count)) return;
+            if (count <= 1) signalledAdds.Remove(signal.Id); else signalledAdds[signal.Id] = count - 1;
+        }
+    }
+    private bool HasSignalledAdd(string id) { lock (coverageGate) return signalledAdds.ContainsKey(id); }
+    private sealed class PendingSignalOwner(NotificationService service, Queue<Signal> signals) : IDisposable
+    {
+        public void Dispose() { foreach (var signal in signals) service.CompleteSignal(signal); }
+    }
+    private void SetError(string cause)
+    {
+        if (!CauseCodes.Allowed.Contains(cause)) cause = "adapterUnavailable";
+        if (cause == "tooManyUsers") tooManyUsers = true;
+        if (cause != error) { error = cause; diagnostics.Record(cause); }
+    }
+    public HealthResponse Health()
+    {
+        var config = configuration(); var s = CurrentSnapshot();
+        return new(config.Enabled && !string.IsNullOrWhiteSpace(config.Secret) && s.SetupHash == Identity.Hash(config.Secret) && Heartbeat.Healthy(s, timeProvider, lanes.Stuck) ? "healthy" : "not", Identity.Hash(config.Secret));
+    }
+    public object Diagnostics() => new { status = CurrentSnapshot(), health = Health().Health, causes = diagnostics.Read() };
+    public async Task<bool> Bind(string registration, string profile, string userHash, CancellationToken ct)
+    {
+        var config = configuration();
+        if (!config.Enabled || config.Secret.Length == 0 || !Identity.IsId(registration) || !Binding.ValidProfile(profile)) return false;
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!bindQueue.Writer.TryWrite(new(new(registration, profile, userHash, Identity.Hash(config.Secret), Now), completion))) return false;
+        try { return await completion.Task.WaitAsync(TimeSpan.FromSeconds(15), ct); }
+        catch (TimeoutException) { return false; }
+    }
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
-        await Task.Yield(); // .NET 9 StartAsync invokes ExecuteAsync synchronously.
-        // Reopen/replay after a completed sharing failure: a failed append or
-        // fsync may already be durable, so never blindly repeat a transaction.
+        await Task.Yield();
+        // The heartbeat task is supervisor-owned and outlives every journal session.
+        var heartbeat = HeartbeatLoop(ct);
         int failures = 0;
-        long? lastFailureLog = null, lastFailureHeartbeat = null;
-        void Healthy()
-        {
-            failures = 0; lastFailureLog = null; lastFailureHeartbeat = null;
-        }
-        while (!ct.IsCancellationRequested)
-        {
-            try { await Run(ct, Healthy); return; }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
-            catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException))
-            {
-                // Shutdown may race a sharing failure or worker cleanup. Do
-                // not turn cancellation into a timeout diagnostic or heartbeat.
-                if (ct.IsCancellationRequested) return;
-                Volatile.Write(ref enabled, false);
-                SetError("stateUnavailable");
-                bool retryable = StateFailure.IsSharing(ex);
-                long now = timeProvider.GetTimestamp();
-                if (!retryable || lastFailureLog is null || timeProvider.GetElapsedTime(lastFailureLog.Value, now) >= TimeSpan.FromHours(1))
-                {
-                    var cause = StateFailure.Cause(ex);
-                    // Never pass the exception itself, its message, paths or IDs.
-                    logger.LogError("[JellySee Notifications] State unavailable (stateUnavailable); exceptionType={ExceptionType}; hResult={HResult:X8}",
-                        cause.GetType().FullName, cause.HResult);
-                    lastFailureLog = now;
-                }
-                // Failure reports share the relay's 12/hour setup budget.
-                // Leave room for the first normal heartbeat after recovery;
-                // this cooldown never gates that normal heartbeat.
-                bool heartbeatDue = lastFailureHeartbeat is null || timeProvider.GetElapsedTime(lastFailureHeartbeat.Value, now) >= TimeSpan.FromMinutes(15);
-                if (await ReportStateUnavailable(ct, heartbeatDue)) lastFailureHeartbeat = now;
-                if (!retryable) return;
-            }
-            finally
-            {
-                Volatile.Write(ref enabled, false);
-                library.ItemAdded -= Added; library.ItemRemoved -= Removed; library.ItemUpdated -= Updated;
-            }
-            failures = Math.Min(failures + 1, 7);
-            try { await stateRetryDelay(TimeSpan.FromSeconds(Math.Min(60, 1 << (failures - 1))), ct); }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
-        }
-    }
-    private async Task<bool> ReportStateUnavailable(CancellationToken ct, bool heartbeatDue)
-    {
-        // A timed-out worker may still own/mutate its state. Health must never
-        // inspect it or retry its path; only completed workers can be reopened.
+        Dictionary<string, long> logged = new(StringComparer.Ordinal);
         try
         {
-            var config = configuration();
-            config.Status = "stateUnavailable";
-            if (heartbeatDue && config.Enabled && !string.IsNullOrWhiteSpace(config.Secret) && !ct.IsCancellationRequested)
+            while (!ct.IsCancellationRequested)
             {
-                // Count attempts even on transport failure: the relay may have
-                // consumed its budget before the response was lost.
-                try { await relay.Post(config.RelayOrigin, Identity.ServerKey(host.SystemId), config.Secret, "heartbeat",
-                    Heartbeat.Encode(host.SystemId, new State(), Now, "stateUnavailable", false, 0), [], ct); }
-                catch (Exception ex) when (ex is not OutOfMemoryException) { }
-                return true;
+                var ownership = new StateOwnership();
+                try
+                {
+                    var paths = statePaths();
+                    using var journal = openJournal(paths.Directory, paths.Root, ct, ownership);
+                    await RunJournal(journal, ct, () => failures = 0);
+                    if (!ct.IsCancellationRequested) throw new StatePersistenceException(new IOException());
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+                catch (Exception ex) when (ex is not OutOfMemoryException)
+                {
+                    if (ct.IsCancellationRequested) break;
+                    Volatile.Write(ref enabled, false); UncoverLibraries();
+                    SetError("stateUnavailable");
+                    Volatile.Write(ref snapshot, Volatile.Read(ref snapshot) with { StorageUnavailable = true, ErrorCode = error, RestartRequired = !ownership.CanRestart });
+                    string cause = StateFailure.Cause(ex).GetType().FullName ?? "Exception";
+                    if (!logged.TryGetValue(cause, out long last) || timeProvider.GetElapsedTime(last) >= TimeSpan.FromHours(1))
+                    { try { logger.LogError("[JellySee Notifications] State unavailable (stateUnavailable); exceptionType={ExceptionType}; hResult={HResult:X8}", cause, StateFailure.Cause(ex).HResult); } catch (Exception loggingError) when (loggingError is not OutOfMemoryException) { } logged[cause] = Mono; }
+                }
+                finally
+                {
+                    Volatile.Write(ref enabled, false); UncoverLibraries();
+                    library.ItemAdded -= Added; library.ItemRemoved -= Removed; library.ItemUpdated -= Updated;
+                }
+                // No second writer, even if construction failed before returning a Journal.
+                while (!ownership.CanRestart && !ct.IsCancellationRequested)
+                {
+                    SetError("restartRequired");
+                    Volatile.Write(ref snapshot, Volatile.Read(ref snapshot) with { RestartRequired = true, StorageUnavailable = true, ErrorCode = "restartRequired" });
+                    await stateRetryDelay(TimeSpan.FromSeconds(1), ct);
+                }
+                if (ct.IsCancellationRequested) break;
+                diagnostics.Record("stateRecovered");
+                failures = Math.Min(failures + 1, 10);
+                await stateRetryDelay(TimeSpan.FromSeconds(Math.Min(300, 1 << (failures - 1))), ct);
             }
         }
-        catch (Exception ex) when (ex is not OutOfMemoryException)
-        { /* Keep the fixed dashboard failure even if configuration lookup fails. */ }
-        return false;
-    }
-    private async Task Run(CancellationToken ct, Action healthy)
-    {
-        var paths = statePaths();
-        using var journal = new Journal(paths.Directory, paths.Root, ct, stateIoTimeout);
-        try { await RunJournal(journal, ct, healthy); }
-        catch (Exception ex) when (StateFailure.IsSharing(ex))
+        finally
         {
-            journal.Dispose();
-            ct.ThrowIfCancellationRequested();
-            if (!journal.CanRestart) throw new StatePersistenceException(new TimeoutException());
-            throw;
+            try { await heartbeat; } catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+            lanes.Dispose(); diagnostics.Dispose();
+            while (bindQueue.Reader.TryRead(out var binding)) binding.Completion.TrySetResult(false);
         }
+    }
+    private async Task HeartbeatLoop(CancellationToken ct)
+    {
+        long? lastAttempt = null; string lastState = ""; int offset = 0;
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                var config = configuration(); var s = CurrentSnapshot();
+                string state = Identity.Hash(config.Secret) + ":" + s.RestartRequired + ":" + s.StorageUnavailable + ":" + lanes.Stuck;
+                bool scheduled = lastAttempt is null || timeProvider.GetElapsedTime(lastAttempt.Value) >= TimeSpan.FromMinutes(10);
+                bool transition = state != lastState && (lastAttempt is null || timeProvider.GetElapsedTime(lastAttempt.Value) >= TimeSpan.FromMinutes(5));
+                if (config.Enabled && config.Secret.Length != 0 && (scheduled || transition) && limiter.TryAcquire())
+                {
+                    lastAttempt = Mono; lastState = state;
+                    try
+                    {
+                        var hashes = await lanes.Admins(ct);
+                        bool overflow = hashes.Length > 64;
+                        Volatile.Write(ref admins, new(overflow ? [] : hashes, Mono, overflow, overflow ? "tooManyUsers" : "none"));
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                    catch (TooManyUsersException) { Volatile.Write(ref admins, new([], Mono, true, "tooManyUsers")); }
+                    catch (Exception ex) when (ex is not OutOfMemoryException)
+                    { string cause = ex is LibraryCallException ? "requiredCallTimeout" : "itemEvaluationFailed"; Volatile.Write(ref admins, new([], Mono, false, cause)); diagnostics.Record(cause); }
+                    s = CurrentSnapshot();
+                    string hash = Identity.Hash(config.Secret);
+                    var bindings = s.Bindings.Where(b => b.SetupHash == hash).ToArray();
+                    var report = bindings.Skip(offset).Take(32).ToArray();
+                    byte[] body = Heartbeat.Encode(host.SystemId, s with { ErrorCode = lanes.Stalled ? "jellyfinStalled" : lanes.Stuck ? "libraryStalled" : s.ErrorCode }, timeProvider, lanes.Stuck, report);
+                    var result = await relay.Post(config.RelayOrigin, Identity.ServerKey(host.SystemId), config.Secret, "heartbeat", body, [], ct);
+                    if (result.Success) { offset = bindings.Length == 0 ? 0 : (offset + report.Length) % bindings.Length; Interlocked.Exchange(ref reportedDroppedTotal, s.DroppedTotal); }
+                    else limiter.Backoff(result.RetryAfter ?? TimeSpan.FromMinutes(5));
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+            catch (Exception ex) when (ex is not OutOfMemoryException) { /* Keep last-known counters and retry on the independent timer. */ }
+            await Task.Delay(TimeSpan.FromSeconds(1), timeProvider, ct);
+        }
+    }
+    private void PersistClockCorrection(Journal journal)
+    {
+        if (pendingClockCorrection is not { } correction) return;
+        if (journal.State.Health.ClockCorrectionId != correction.Id)
+        {
+            List<Change> changes = [new() { Kind = "health", Health = journal.State.Health with { QuietThroughSeq = Math.Max(correction.Fence, journal.State.Health.QuietThroughSeq), ClockCorrectionId = correction.Id } }];
+            foreach (var pair in correction.Recoveries)
+                if (journal.State.Recoveries.TryGetValue(pair.Key, out var recovery) && recovery.Id == pair.Value.Id)
+                    changes.Add(new() { Kind = "recovery", Recovery = recovery with { CutoffAt = pair.Value.Cutoff } });
+            journal.Commit(changes.ToArray());
+        }
+        pendingClockCorrection = null;
     }
     private async Task RunJournal(Journal journal, CancellationToken ct, Action healthy)
     {
-        if (error == "stateUnavailable") SetError("none");
-        string key = Identity.ServerKey(host.SystemId);
-        var engine = new Engine(journal, compat, key);
-        if (journal.RecoveredCorruption) SetError("stateRecovered");
+        PersistClockCorrection(journal);
+        lanes.NewSession();
+        var engine = new Engine(journal, lanes, Identity.ServerKey(host.SystemId));
+        SetError(journal.RecoveredCorruption ? "stateRecovered" : "none");
+        Volatile.Write(ref snapshot, Volatile.Read(ref snapshot) with { BootId = Identity.EventId(), RestartRequired = false, StorageUnavailable = false, ErrorCode = error, UncoveredStamp = Mono, OutboxDepth = journal.State.Notices.Values.Count(n => n.Stage == "outbox"), IndexCount = journal.State.Index.Count, Dropped = journal.State.Health.Dropped - journal.State.Health.ReportedDropped, DroppedTotal = journal.State.Health.Dropped, LastAckAt = journal.State.Health.LastAckAt, IndexFull = journal.State.Health.IndexFull, Bindings = journal.State.Bindings.Values.ToImmutableArray() });
         library.ItemAdded += Added; library.ItemRemoved += Removed; library.ItemUpdated += Updated;
-        long nextInventory = 0, nextReconcile = 0, nextReady = 0, nextHeartbeat = 0, nextLibrary = 0, dirtyAt = 0;
-        long lastQueued = Now;
-        string configStamp = "";
-        int emptyPolls = 0;
-        Dictionary<string, SendSchedule> schedules = new(StringComparer.Ordinal);
         var reconciliation = new ReconcileQueue();
         Scan? scan = null;
+        var pendingSignals = new Queue<Signal>();
+        using var pendingOwner = new PendingSignalOwner(this, pendingSignals);
+        var removedThrough = new Dictionary<string, long>(StringComparer.Ordinal);
+        var schedules = new Dictionary<string, SendSchedule>(StringComparer.Ordinal);
         var sentAt = new Queue<long>();
+        var bindingSentAt = new Queue<long>();
+        var reportedBindings = new HashSet<string>(StringComparer.Ordinal);
+        var refreshBindings = new HashSet<string>(StringComparer.Ordinal);
+        var bindingReportOrder = new Dictionary<string, long>(StringComparer.Ordinal);
+        long reportOrder = 0;
+        static string ReportKey(Binding b) => b.Key + ":" + b.Profile + ":" + b.UserHash;
+        string configStamp = "";
+        long? inventoryAt = null, reconcileAt = null, readyAt = null, queuedAt = null, libraryAt = null;
+        long? oldestStamp = null, uncoveredStamp = Mono;
+        string? oldestId = null;
+        int emptyPolls = 0;
+        bool readyRequested = false, inventoryComplete = false;
+        HashSet<string> updated = new(StringComparer.Ordinal);
+        HashSet<string> evaluatingAdds = new(StringComparer.Ordinal);
+        bool Due(long? at, double seconds) => at is null || timeProvider.GetElapsedTime(at.Value).TotalSeconds >= seconds;
         await IterationLoop.Run(async () =>
         {
-            long now = Now;
-            var config = configuration();
+            long slice = Mono;
+            engine.BudgetAvailable = () => timeProvider.GetElapsedTime(slice) < TimeSpan.FromSeconds(2);
+            long now = Now; var config = configuration();
+            var credentials = Credentials.Available(config, WallNow);
+            engine.PruneSetups(credentials.Keys.ToHashSet(StringComparer.Ordinal));
             bool configured = config.Enabled && !string.IsNullOrWhiteSpace(config.Secret);
             string stamp = Identity.Hash(config.Enabled + ":" + config.RelayOrigin + ":" + config.Secret);
+            void Uncover(string cause, string? folder = null)
+            {
+                SetError(cause); UncoverLibraries(folder); uncoveredStamp ??= Mono; reconciliation.Request();
+                if (configured) engine.BeginRecovery(Identity.Hash(config.Secret), now);
+            }
+            if (Math.Abs(WallNow - now) > 120)
+            {
+                long corrected = WallNow, delta = corrected - now;
+                pendingClockCorrection = new(Identity.EventId(), journal.State.Seq, journal.State.Recoveries.ToDictionary(p => p.Key, p => (p.Value.Id, Math.Max(0, p.Value.CutoffAt + delta))));
+                lock (coverageGate) { Volatile.Write(ref utcAnchor, new(corrected, Mono)); clockEpoch++; UncoverLibraries(); }
+                now = corrected;
+                PersistClockCorrection(journal);
+                lanes.NewSession(); engine.InvalidateAudienceCursors(); scan = null; inventoryComplete = false; inventoryAt = null;
+                Uncover("reconcileFailed"); reconcileAt = null;
+            }
             if (stamp != configStamp)
             {
                 configStamp = stamp; Volatile.Write(ref setupHash, Identity.Hash(config.Secret));
-                Volatile.Write(ref enabled, configured); nextHeartbeat = 0; nextInventory = 0; nextReconcile = 0;
-                if (!schedules.ContainsKey(setupHash)) schedules[setupHash] = new();
-                schedules[setupHash].Next = 0;
+                Volatile.Write(ref enabled, configured); inventoryAt = null; reconcileAt = null;
+                schedules.Clear(); inventoryComplete = false; Uncover("none");
             }
+            long acknowledgedDrops = Interlocked.Read(ref reportedDroppedTotal);
+            if (acknowledgedDrops > journal.State.Health.ReportedDropped && acknowledgedDrops <= journal.State.Health.Dropped) journal.Commit(new Change { Kind = "health", Health = journal.State.Health with { ReportedDropped = acknowledgedDrops } });
             long lost = Interlocked.Exchange(ref channelDropped, 0);
-            if (lost != 0) journal.Commit(new Change() { Kind = "health", Health = journal.State.Health with { Dropped = journal.State.Health.Dropped + lost } });
-            for (int i = 0; i < 250 && channel.Reader.TryRead(out var signal); i++)
+            if (lost != 0) { Uncover("channelDropped"); journal.Commit(new Change { Kind = "health", Health = journal.State.Health with { Dropped = journal.State.Health.Dropped + lost } }); reconcileAt = null; scan = null; }
+            for (int admitted = 0; admitted < 8 && timeProvider.GetElapsedTime(slice) < TimeSpan.FromMilliseconds(250) && engine.BudgetAvailable() && bindQueue.Reader.TryRead(out var bind); admitted++)
             {
-                ct.ThrowIfCancellationRequested();
-                switch (signal.Op)
+                try
                 {
-                    case "add": engine.QueueAdd(signal.Id, signal.Type!, signal.EventId, signal.At, signal.Setup); scan?.Known.Add(signal.Id); lastQueued = now; break;
-                    case "rm": engine.Remove(signal.Id, signal.EventId, signal.At, signal.Setup); scan?.Known.Remove(signal.Id); lastQueued = now; break;
-                    case "update":
-                        try { if (compat.Get(signal.Id) is { } item) engine.Index(item); }
-                        catch (StatePersistenceException) { throw; }
-                        catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException)) { SetError("itemEvaluationFailed"); }
-                        break;
-                    case "dirty": if (dirtyAt == 0) dirtyAt = now + 30; break;
+                    var retained = journal.State.Bindings.Values.Where(b => b.SetupHash == bind.Binding.SetupHash).ToArray();
+                    var prior = journal.State.Bindings.GetValueOrDefault(bind.Binding.Key);
+                    if (prior is not null && prior.UserHash != bind.Binding.UserHash) { bind.Completion.TrySetResult(false); continue; }
+                    // Repeat approvals need a fresh relay report, not another durable write or a
+                    // revocation of an already submitted tuple's notification eligibility.
+                    if (prior is not null && prior.Profile == bind.Binding.Profile)
+                    { refreshBindings.Add(ReportKey(prior)); bind.Completion.TrySetResult(true); continue; }
+                    var owned = retained.Where(b => b.UserHash == bind.Binding.UserHash).OrderBy(b => b.Sequence).ThenBy(b => b.BoundAt).ThenBy(b => b.Key, StringComparer.Ordinal).ToArray();
+                    if (prior is null && retained.Length >= 500 && owned.Length == 0) { bind.Completion.TrySetResult(false); continue; }
+                    int evict = Math.Max(0, owned.Length + (prior is null ? 1 : 0) - 64);
+                    if (prior is null && retained.Length >= 500) evict = Math.Max(1, evict);
+                    List<Change> changes = owned.Where(b => b.Key != bind.Binding.Key).Take(evict).Select(b => new Change { Kind = "unbinding", Key = b.Key }).ToList();
+                    changes.Add(new() { Kind = "binding", Binding = bind.Binding with { Sequence = journal.State.Seq + 1 } });
+                    foreach (var chunk in changes.Chunk(200)) journal.Commit(chunk);
+                    reportedBindings.Remove(ReportKey(bind.Binding));
+                    bind.Completion.TrySetResult(true);
                 }
+                catch { bind.Completion.TrySetResult(false); throw; }
             }
+            while (pendingSignals.Count < State.Capacity && channel.Reader.TryRead(out var signal)) pendingSignals.Enqueue(signal);
+            int signals = Math.Min(250, pendingSignals.Count);
+            for (int i = 0; i < signals && pendingSignals.Count != 0 && engine.BudgetAvailable(); i++)
+            {
+                var signal = pendingSignals.Dequeue();
+                if (signal.Op is "add" or "update" && signal.Sequence < removedThrough.GetValueOrDefault(signal.Id)) { CompleteSignal(signal); continue; }
+                bool retry = false;
+                try
+                {
+                    string origin = signal.Origin;
+                    if (signal.Op == "add")
+                    {
+                        if (journal.State.Notices.Values.Any(n => n.Op == "add" && n.Id == signal.Id && n.Life == engine.Life(signal.Id))) continue;
+                        if (evaluatingAdds.Add(signal.Id)) lanes.Invalidate(signal.Id);
+                        var item = lanes.Read(signal.Id, signal.At, now);
+                        if (item is null) continue;
+                        if (item.Title.Folders.Length == 0 || !item.Title.Folders.All(signal.Coverage.Contains)) origin = "recovery";
+                        engine.QueueAdd(signal.Id, signal.Type!, signal.EventId, signal.At, signal.Setup, origin, signal.ClockEpoch != Interlocked.Read(ref clockEpoch));
+                        scan?.Known.Add(signal.Id); queuedAt = Mono; readyRequested = true;
+                    }
+                    else if (signal.Op == "rm")
+                    {
+                        removedThrough[signal.Id] = signal.Sequence; lanes.Invalidate(signal.Id); updated.Remove(signal.Id); evaluatingAdds.Remove(signal.Id);
+                        if (!journal.State.Index.TryGetValue(signal.Id, out var title) || title.Folders.Length == 0 || !title.Folders.All(signal.Coverage.Contains)) origin = "recovery";
+                        engine.Remove(signal.Id, signal.EventId, signal.At, signal.Setup, origin, signal.ClockEpoch != Interlocked.Read(ref clockEpoch)); scan?.Known.Remove(signal.Id); queuedAt = Mono;
+                    }
+                    else if (signal.Op == "update")
+                    {
+                        if (updated.Add(signal.Id)) lanes.Invalidate(signal.Id);
+                        if (journal.State.Notices.Values.Any(n => n.Id == signal.Id && n.Stage == "pendingAdd")) { engine.AdvanceAdds(now, code => { if (code == "requiredCallTimeout") Uncover(code); else SetError(code); }, signal.Id); readyRequested = true; }
+                        else if (journal.State.Index.ContainsKey(signal.Id) && lanes.Read(signal.Id, signal.At, now) is { } item) engine.Index(item.Title);
+                        updated.Remove(signal.Id);
+                    }
+                    else reconcileAt = null;
+                }
+                catch (LibraryPendingException) { pendingSignals.Enqueue(signal); retry = true; }
+                catch (LibraryCallException) { Uncover("requiredCallTimeout"); pendingSignals.Enqueue(signal); retry = true; }
+                finally { if (!retry) { CompleteSignal(signal); if (signal.Op == "add") evaluatingAdds.Remove(signal.Id); } }
+            }
+            var pendingIds = pendingSignals.Select(s => s.Id).ToHashSet(StringComparer.Ordinal);
+            foreach (string id in removedThrough.Keys.Where(id => !pendingIds.Contains(id)).ToArray()) removedThrough.Remove(id);
             if (configured)
             {
-                if (now >= nextInventory)
+                if (Due(inventoryAt, 120) && engine.BudgetAvailable())
                 {
                     try
                     {
-                        var poll = InventoryRules.Evaluate(journal.State.Libraries.Values.ToArray(), compat.Inventory(), true, emptyPolls);
+                        var view = lanes.Inventory();
+                        var poll = InventoryRules.Evaluate(journal.State.Libraries.Values.ToArray(), view.Libraries, true, emptyPolls);
                         emptyPolls = poll.EmptyPolls;
-                        if (poll.Complete)
-                        {
-                            bool changed = ReconcileInventory(journal, engine, poll, now, setupHash);
-                            if (changed) { nextReconcile = 0; lastQueued = now; }
-                        }
-                        else SetError("inventoryIncomplete");
+                        if (poll.Complete) { lock (coverageGate) libraryRoots = view.Roots.Where(r => poll.Current.Any(l => l.Id == r.Id)).ToImmutableArray(); inventoryComplete = true; if (error == "inventoryIncomplete") SetError("none"); if (ReconcileInventory(journal, engine, poll, now, setupHash)) { reconcileAt = null; queuedAt = Mono; } }
+                        else { inventoryComplete = false; Uncover("inventoryIncomplete"); }
+                        inventoryAt = Mono;
                     }
-                    catch (IOException ex) when (ex is not StatePersistenceException) { emptyPolls = 0; SetError("inventoryIncomplete"); }
-                    catch (UnauthorizedAccessException) { emptyPolls = 0; SetError("inventoryIncomplete"); }
-                    catch (InvalidOperationException) { emptyPolls = 0; SetError("inventoryIncomplete"); }
-                    nextInventory = now + 120;
+                    catch (LibraryPendingException) { }
+                    catch (Exception ex) when (ex is not (StatePersistenceException or OutOfMemoryException or OperationCanceledException)) { inventoryComplete = false; Uncover("inventoryIncomplete"); inventoryAt = Mono; }
                 }
-                if (dirtyAt != 0 && now >= dirtyAt || now >= nextReconcile)
+                if (Due(reconcileAt, 900)) { reconciliation.Request(); reconcileAt = Mono; }
+                if (scan is null && !lanes.Stuck && Due(libraryAt, 5) && reconciliation.Next(journal.State.Libraries.Values) is { } folder)
+                { scan = new(folder, journal.State.Seq, journal.State, Volatile.Read(ref covered).Contains(folder.Id), Interlocked.Read(ref coverageEpoch)); libraryAt = Mono; }
+                if (scan is not null && engine.BudgetAvailable())
                 {
-                    reconciliation.Request();
-                    nextReconcile = now + 900; dirtyAt = 0;
-                }
-                if (scan is null && now >= nextLibrary && reconciliation.Next(journal.State.Libraries.Values) is { } folder)
-                {
-                    if (journal.State.Libraries.Values.Any(l => l.Id == folder.Id))
+                    try
                     {
-                        try { scan = new Scan(folder, compat.Ids(folder.Id), journal.State.Seq, journal.State); }
-                        catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException)) { SetError("reconcileFailed"); }
-                    }
-                    nextLibrary = now + 5;
-                }
-                if (scan is not null)
-                {
-                    // Pace metadata/index work; GetItemIds itself is one unpaged ids-only query.
-                    List<BaseItem> toIndex = [];
-                    for (int i = 0; i < 1000 && scan.Position < scan.Ids.Count; i++, scan.Position++)
-                    {
-                        ct.ThrowIfCancellationRequested();
-                        string id = scan.Ids[scan.Position].ToString("N");
-                        try
+                        scan.Ids ??= lanes.Ids(scan.Library.Id, scan.PassId);
+                        scan.Present ??= scan.Ids.Select(id => id.ToString("N")).ToHashSet(StringComparer.Ordinal);
+                        for (int i = 0; i < 1000 && scan.Position < scan.Ids.Count && engine.BudgetAvailable(); i++)
                         {
-                            var item = compat.Get(id);
-                            if (item is null || !compat.IsTitle(item)) continue;
-                            bool known = scan.Known.Contains(id);
-                            if (scan.Library.BaselineComplete && !known && !journal.State.Health.IndexFull &&
-                                !(journal.State.Tombstones.TryGetValue(id, out var tomb) && tomb.Seq > scan.StartSeq))
-                            { engine.QueueAdd(id, compat.TitleType(item)!, Identity.EventId(), now, setupHash); scan.Known.Add(id); lastQueued = now; }
-                            // Unknown recovered additions are indexed only when ready; baseline entries and
-                            // known titles can be refreshed immediately, respecting the pass tombstone fence.
-                            if (!scan.Library.BaselineComplete || journal.State.Index.ContainsKey(id)) toIndex.Add(item);
+                            string id = scan.Ids[scan.Position].ToString("N");
+                            var item = lanes.Read(id, now, now);
+                            if (item is not null)
+                            {
+                                bool known = scan.Known.Contains(id);
+                                if (scan.Library.BaselineComplete && !known && !HasSignalledAdd(id) && !journal.State.Health.IndexFull && !(journal.State.Tombstones.TryGetValue(id, out var tomb) && tomb.Seq > scan.StartSeq))
+                                {
+                                    string origin = scan.WasCovered && now - scan.Library.CoveredUntil <= 1800 && Volatile.Read(ref covered).Contains(scan.Library.Id) ? "live" : "recovery";
+                                    engine.QueueAdd(id, item.Title.Type, Identity.EventId(), now, setupHash, origin); scan.Known.Add(id); queuedAt = Mono; readyRequested = true;
+                                }
+                                if (!scan.Library.BaselineComplete || journal.State.Index.ContainsKey(id)) engine.Index(item.Title, scan.StartSeq);
+                            }
+                            scan.Position++;
                         }
-                        catch (StatePersistenceException) { throw; }
-                        catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException)) { scan.Failed = true; SetError("reconcileFailed"); }
-                    }
-                    engine.IndexMany(toIndex, scan.StartSeq, SetError);
-                    if (scan.Position == scan.Ids.Count)
-                    {
-                        foreach (var title in journal.State.Index.Values.Where(t => t.Folders.Contains(scan.Library.Id) && !scan.Present.Contains(Guid.ParseExact(t.Id, "N"))).ToArray())
+                        if (scan.Position == scan.Ids.Count)
                         {
-                            ct.ThrowIfCancellationRequested();
-                            try { if (compat.Get(title.Id) is null) { engine.Remove(title.Id, Identity.EventId(), now, setupHash); lastQueued = now; } }
-                            catch (StatePersistenceException) { throw; }
-                            catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException)) { scan.Failed = true; SetError("reconcileFailed"); }
+                            // The complete ids census is definitive membership, never an empty timeout result.
+                            scan.Removals ??= journal.State.Index.Values.Where(t => t.Folders.Contains(scan.Library.Id) && !scan.Present.Contains(t.Id)).ToArray();
+                            while (scan.RemovalPosition < scan.Removals.Length && engine.BudgetAvailable())
+                            {
+                                var title = scan.Removals[scan.RemovalPosition];
+                                if (journal.State.Index.TryGetValue(title.Id, out var currentTitle) && currentTitle.Folders.Contains(scan.Library.Id) && !HasSignalledAdd(title.Id))
+                                {
+                                    var item = lanes.Read(title.Id, now, now);
+                                    if (item is null) engine.Remove(title.Id, Identity.EventId(), now, setupHash, scan.WasCovered && now - scan.Library.CoveredUntil <= 1800 && Volatile.Read(ref covered).Contains(scan.Library.Id) ? "live" : "recovery");
+                                    else engine.Index(item.Title, scan.StartSeq);
+                                }
+                                scan.RemovalPosition++;
+                            }
+                            if (scan.RemovalPosition != scan.Removals.Length) throw new LibraryPendingException();
+                            if (journal.State.Libraries.TryGetValue(scan.Library.DirectoryKey, out var current))
+                                journal.Commit(new Change { Kind = "library", Library = current with { BaselineComplete = true, CoveredUntil = now } });
+                            if (!TryCover(scan.Library.Id, scan.Epoch)) reconciliation.Request();
+                            scan = null;
+                            if (inventoryComplete && !lanes.Stuck && error is "libraryStalled" or "requiredCallTimeout" or "reconcileFailed" or "inventoryIncomplete" or "channelDropped") SetError("none");
                         }
-                        if (!scan.Failed && !scan.Library.BaselineComplete && journal.State.Libraries.ContainsKey(scan.Library.DirectoryKey))
-                            journal.Commit(new Change() { Kind = "library", Library = scan.Library with { BaselineComplete = true } });
-                        scan = null;
                     }
+                    catch (LibraryPendingException) { }
+                    catch (Exception ex) when (ex is not (StatePersistenceException or OutOfMemoryException or OperationCanceledException))
+                    { Uncover(ex is LibraryCallException ? "requiredCallTimeout" : "reconcileFailed", scan?.Library.Id); scan = null; }
                 }
-                if (now >= nextReady)
+                if ((Due(readyAt, 30) || readyRequested) && engine.BudgetAvailable())
                 {
-                    tooManyUsers = false;
-                    try { compat.Users(key); }
+                    engine.ResetPendingWork(); bool rosterPending = false;
+                    try
+                    {
+                        lanes.Users(); tooManyUsers = false;
+                        if (error == "tooManyUsers") SetError("none");
+                        engine.AdvanceAdds(now, code => { if (code == "requiredCallTimeout") Uncover(code); else SetError(code); });
+                        engine.AdvanceRemovals(now, code => { if (code == "requiredCallTimeout") Uncover(code); else SetError(code); });
+                    }
+                    catch (LibraryPendingException) { rosterPending = true; }
                     catch (TooManyUsersException) { SetError("tooManyUsers"); }
-                    if (!tooManyUsers) { engine.AdvanceAdds(now, SetError); engine.AdvanceRemovals(now, SetError); }
-                    engine.Sweep(now); nextReady = now + 30;
+                    catch (LibraryCallException) { Uncover("requiredCallTimeout"); }
+                    catch (Exception ex) when (ex is not (StatePersistenceException or OutOfMemoryException or OperationCanceledException)) { SetError("adapterUnavailable"); }
+                    engine.Sweep(now); readyAt = Mono; readyRequested = rosterPending || engine.WorkPending;
                 }
-                var credentials = Credentials.Available(config, now);
-                foreach (string hash in credentials.Keys) if (!schedules.ContainsKey(hash)) schedules[hash] = new();
-                foreach (string hash in schedules.Keys.Where(h => !credentials.ContainsKey(h)).ToArray()) schedules.Remove(hash);
-                var group = journal.State.Notices.Values.Where(n => n.Stage == "outbox" && !Rules.Expired(n, now) && credentials.ContainsKey(n.SetupHash))
-                    .GroupBy(n => n.SetupHash).Where(g => schedules[g.Key].Next <= now)
-                    .OrderBy(g => schedules[g.Key].LastAttempt).FirstOrDefault();
-                var pending = group?.OrderBy(n => n.QueuedAt).ToArray() ?? [];
-                var schedule = group is null ? new SendSchedule() : schedules[group.Key];
-                if (!tooManyUsers && pending.Length != 0 && (now - lastQueued >= 60 || now - pending[0].QueuedAt >= 300))
+                bool censusComplete = inventoryComplete && scan is null && journal.State.Libraries.Values.All(l => Volatile.Read(ref covered).Contains(l.Id));
+                if (censusComplete) uncoveredStamp = null; else uncoveredStamp ??= Mono;
+                var pendingSetups = pendingSignals.Where(s => s.Op == "add").Select(s => s.Setup).ToHashSet(StringComparer.Ordinal);
+                var recoveringSetups = journal.State.Notices.Values.Where(n => n.Stage == "pendingAdd" && (n.Origin == "recovery" || n.Folded || n.EnqueuedSeq <= journal.State.Health.QuietThroughSeq)).Select(n => n.SetupHash).ToHashSet(StringComparer.Ordinal);
+                foreach (string hash in credentials.Keys)
+                    engine.AdvanceRecovery(hash, now, censusComplete && !pendingSetups.Contains(hash) && !recoveringSetups.Contains(hash));
+                foreach (var hash in credentials.Keys) if (!schedules.ContainsKey(hash)) schedules[hash] = new();
+                while (sentAt.TryPeek(out long prior) && timeProvider.GetElapsedTime(prior) >= TimeSpan.FromMinutes(1)) sentAt.Dequeue();
+                while (bindingSentAt.TryPeek(out long bindingAt) && timeProvider.GetElapsedTime(bindingAt) >= TimeSpan.FromMinutes(1)) bindingSentAt.Dequeue();
+                if (Math.Max(Math.Max(reportedBindings.Count, refreshBindings.Count), bindingReportOrder.Count) > journal.State.Bindings.Count + 64)
                 {
-                    while (sentAt.Count != 0 && now - sentAt.Peek() >= 60) sentAt.Dequeue();
+                    var retainedReports = journal.State.Bindings.Values.Select(ReportKey).ToHashSet(StringComparer.Ordinal);
+                    reportedBindings.IntersectWith(retainedReports); refreshBindings.IntersectWith(retainedReports);
+                    foreach (string key in bindingReportOrder.Keys.Where(k => !retainedReports.Contains(k)).ToArray()) bindingReportOrder.Remove(key);
+                }
+                var bindingGroup = journal.State.Bindings.Values.Where(b => credentials.ContainsKey(b.SetupHash) && (!reportedBindings.Contains(ReportKey(b)) || refreshBindings.Contains(ReportKey(b))))
+                    .OrderBy(b => bindingReportOrder.GetValueOrDefault(ReportKey(b))).ThenBy(b => b.Sequence).ThenBy(b => b.Key, StringComparer.Ordinal)
+                    .GroupBy(b => b.SetupHash).Where(g => schedules[g.Key].Due(timeProvider)).OrderBy(g => schedules[g.Key].LastAttempt).FirstOrDefault();
+                bool eventsWaiting = journal.State.Notices.Values.Any(n => n.Stage == "outbox");
+                if (bindingGroup is not null && sentAt.Count < 20 && (!eventsWaiting || bindingSentAt.Count < 10) && engine.BudgetAvailable())
+                {
+                    var report = bindingGroup.Take(64).ToArray();
+                    byte[] body = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new { v = 3, server = host.SystemId, bindings = report.Select(b => new { registration = b.Registration, profile = b.Profile, userHash = b.UserHash }) });
+                    sentAt.Enqueue(Mono); bindingSentAt.Enqueue(Mono); schedules[bindingGroup.Key].LastAttempt = Mono;
+                    foreach (var b in report) bindingReportOrder[ReportKey(b)] = ++reportOrder;
+                    var result = await relay.Post(config.RelayOrigin, Identity.ServerKey(host.SystemId), credentials[bindingGroup.Key], "bindings", body, [], ct);
+                    if (result.Success) foreach (var b in report) { reportedBindings.Add(ReportKey(b)); refreshBindings.Remove(ReportKey(b)); }
+                    else schedules[bindingGroup.Key].Delay(timeProvider, ProbeDelay(result, ++schedules[bindingGroup.Key].Attempts));
+                }
+                // A summary waits for its profile's approvals present at creation. Later registration
+                // churn cannot move that finite barrier; legacy events do not depend on bindings.
+                var group = journal.State.Notices.Values.Where(n => n.Stage == "outbox" && (n.Op != "summary" || journal.State.Recoveries.Values.Any(r => r.Id == n.OutageId && r.Emitted) &&
+                        !journal.State.Bindings.Values.Any(b => b.SetupHash == n.SetupHash && b.Profile == n.Profile && b.Sequence <= n.EnqueuedSeq && !reportedBindings.Contains(ReportKey(b)))) &&
+                        !Rules.Expired(n, now) && credentials.ContainsKey(n.SetupHash))
+                    .GroupBy(n => n.SetupHash).Where(g => schedules[g.Key].Due(timeProvider)).OrderBy(g => schedules[g.Key].LastAttempt).FirstOrDefault();
+                var pending = group?.OrderBy(n => n.EnqueuedSeq <= journal.State.Health.QuietThroughSeq ? 0 : 1).ThenBy(n => n.QueuedAt).ToArray() ?? [];
+                if (!tooManyUsers && pending.Length != 0 && (Due(queuedAt, 60) || now - pending[0].QueuedAt >= 300) && engine.BudgetAvailable())
+                {
+                    var schedule = schedules[group!.Key];
+                    while (sentAt.TryPeek(out long sent) && timeProvider.GetElapsedTime(sent) >= TimeSpan.FromMinutes(1)) sentAt.Dequeue();
                     if (sentAt.Count < 20)
                     {
                         try
                         {
-                            var users = compat.Users(key);
-                            // Freshness is checked immediately before each request, including retries.
-                            List<Notice> fresh = [];
-                            foreach (var notice in pending.Take(50))
+                            var users = lanes.Users(); List<Notice> fresh = [];
+                            foreach (var n in pending.Take(50))
                             {
-                                try { if (engine.Freshen(notice, now) is { } reevaluated) fresh.Add(reevaluated); }
-                                catch (TooManyUsersException) { throw; }
-                                catch (Exception ex) when (ex is not (StatePersistenceException or OutOfMemoryException or OperationCanceledException)) { SetError("itemEvaluationFailed"); }
+                                if (!engine.BudgetAvailable()) break;
+                                try { if (engine.Freshen(n, now) is { } evaluated) fresh.Add(evaluated); }
+                                catch (LibraryPendingException) { }
+                                catch (LibraryCallException) { Uncover("requiredCallTimeout"); }
                             }
-                            var batch = Wire.Split(host.SystemId, users, fresh).FirstOrDefault();
-                            if (batch is not null)
+                            long handoffAt = Now;
+                            for (int i = fresh.Count - 1; i >= 0; i--)
                             {
-                                sentAt.Enqueue(now); schedule.LastAttempt = now;
-                                var result = await relay.Post(config.RelayOrigin, key, credentials[group!.Key], "events", batch.Body, batch.Events.Select(n => n.EventId), ct);
+                                if (fresh[i].Op == "summary" || fresh[i].Quiet || Rules.Audible(fresh[i], handoffAt)) continue;
+                                try { if (engine.Freshen(fresh[i], handoffAt) is { } final) fresh[i] = final; else fresh.RemoveAt(i); }
+                                catch (LibraryPendingException) { fresh.RemoveAt(i); }
+                                catch (LibraryCallException) { Uncover("requiredCallTimeout"); fresh.RemoveAt(i); }
+                            }
+                            if (Wire.Split(host.SystemId, users, fresh).FirstOrDefault() is { } batch)
+                            {
+                                sentAt.Enqueue(Mono); schedule.LastAttempt = Mono;
+                                var result = await relay.Post(config.RelayOrigin, Identity.ServerKey(host.SystemId), credentials[group.Key], "events", batch.Body, batch.Events.Select(n => n.EventId), ct);
                                 if (result.Success)
-                                {
-                                    engine.Acknowledge(result.Accepted, Now); error = "none"; schedule.Attempts = 0;
-                                    // A valid partial/empty acknowledgement must not turn into a tight loop.
-                                    schedule.Next = Now + (result.Accepted.Count == batch.Events.Length ? 0 : 30);
-                                }
+                                { engine.Acknowledge(result.Accepted, Now); SetError("none"); schedule.Attempts = 0; schedule.Delay(timeProvider, TimeSpan.FromSeconds(result.Accepted.Count == batch.Events.Length ? 0 : 30)); }
                                 else
-                                {
-                                    SetError(result.ErrorCode);
-                                    schedule.Next = result.Retryable ? Now + (long)Responses.RetryDelay(++schedule.Attempts, result.RetryAfter, Random.Shared.NextDouble()).TotalSeconds : long.MaxValue;
-                                }
+                                { SetError(result.ErrorCode); schedule.Delay(timeProvider, ProbeDelay(result, ++schedule.Attempts)); }
                             }
-                            else schedule.Next = now + 30;
                         }
-                        catch (TooManyUsersException) { SetError("tooManyUsers"); schedule.Next = now + 30; }
-                        catch (InvalidDataException) { SetError("invalidConfiguration"); schedule.Next = now + 300; }
+                        catch (LibraryPendingException) { }
+                        catch (TooManyUsersException) { SetError("tooManyUsers"); }
+                        catch (InvalidDataException) { SetError("invalidConfiguration"); schedule.Delay(timeProvider, TimeSpan.FromMinutes(15)); }
                     }
-                }
-                if (now >= nextHeartbeat)
-                {
-                    byte[] heartbeat = Heartbeat.Encode(host.SystemId, journal.State, now, error, tooManyUsers, journal.DiskBytes);
-                    try
-                    {
-                        var result = await relay.Post(config.RelayOrigin, key, config.Secret, "heartbeat", heartbeat, [], ct);
-                        if (result.Success)
-                        {
-                            journal.Commit(new Change() { Kind = "health", Health = journal.State.Health with { Dropped = 0 } });
-                            nextHeartbeat = now + 21600;
-                        }
-                        else { SetError(result.ErrorCode); nextHeartbeat = now + Math.Max(300, (long)(result.RetryAfter?.TotalSeconds ?? 300)); }
-                    }
-                    catch (InvalidDataException) { SetError("invalidConfiguration"); nextHeartbeat = now + 300; }
                 }
             }
-            config.Status = configured ? error : "notConfigured";
-            config.IndexFull = journal.State.Health.IndexFull; config.TooManyUsers = tooManyUsers;
-            config.IndexCount = journal.State.Index.Count; config.StateBytes = journal.DiskBytes;
-            config.OutboxDepth = journal.State.Notices.Values.Count(n => n.Stage == "outbox");
-            config.BaselineLibrariesRemaining = journal.State.Libraries.Values.Count(l => !l.BaselineComplete);
-            journal.MaybeCompact();
-            // Reopening alone is insufficient: a failure in this first full
-            // iteration still belongs to the same persistence-failure streak.
-            healthy();
-        }, code =>
-        {
-            if (code != "none" || error == "adapterUnavailable") SetError(code);
-            configuration().Status = error;
-        }, ct);
+            if (lanes.Stuck) { SetError(lanes.Stalled ? "jellyfinStalled" : "libraryStalled"); UncoverLibraries(); uncoveredStamp ??= Mono; }
+            int outbox = journal.State.Notices.Values.Count(n => n.Stage == "outbox");
+            if (outbox == 0) { oldestStamp = null; oldestId = null; }
+            else
+            {
+                var oldest = journal.State.Notices.Values.Where(n => n.Stage == "outbox").MinBy(n => n.ReadyAt)!;
+                long age = Math.Clamp(now - oldest.ReadyAt, 0, 86400);
+                long observed = Mono - age * timeProvider.TimestampFrequency;
+                if (oldestId != oldest.EventId) { oldestStamp = observed; oldestId = oldest.EventId; }
+            }
+            var before = Volatile.Read(ref snapshot);
+            Volatile.Write(ref snapshot, before with { SetupHash = setupHash, ProgressStamp = Mono, ErrorCode = error, StorageUnavailable = false, RestartRequired = false, OutboxDepth = outbox, OldestReadyStamp = oldestStamp, UncoveredStamp = uncoveredStamp,
+                Dropped = journal.State.Health.Dropped - journal.State.Health.ReportedDropped, DroppedTotal = journal.State.Health.Dropped, LastAckAt = journal.State.Health.LastAckAt, IndexFull = journal.State.Health.IndexFull, TooManyUsers = tooManyUsers, IndexCount = journal.State.Index.Count, StateBytes = journal.DiskBytes,
+                BaselineLibrariesRemaining = journal.State.Libraries.Values.Count(l => !l.BaselineComplete), Bindings = journal.State.Bindings.Values.ToImmutableArray() });
+            journal.MaybeCompact(); healthy();
+        }, SetError, ct, (pause, token) => Task.Delay(lanes.Pending && pause == TimeSpan.FromSeconds(1) ? TimeSpan.FromMilliseconds(25) : pause, timeProvider, token));
     }
+    public override void Dispose() { base.Dispose(); lanes.Dispose(); diagnostics.Dispose(); }
+    internal static TimeSpan ProbeDelay(SendResult result, int attempts) => result.Retryable ? Responses.RetryDelay(attempts, result.RetryAfter, 0.5) : result.RetryAfter is { } hint && hint > TimeSpan.FromMinutes(15) ? hint : TimeSpan.FromMinutes(15);
     private static bool ReconcileInventory(Journal journal, Engine engine, InventoryResult poll, long now, string setup)
     {
         bool changed = false;
@@ -363,13 +587,13 @@ public sealed class NotificationService : BackgroundService
         {
             changed = true;
             if (journal.State.Notices.Values.Count(n => n.Stage == "outbox") >= State.Capacity)
-                engine.Drop(journal.State.Notices.Values.Where(n => n.Stage == "outbox").MinBy(n => n.QueuedAt)!.EventId);
+                engine.EvictOutbox();
             journal.Commit(new Change { Kind = "unlibrary", Key = removed.DirectoryKey },
                 new() { Kind = "unroute", Key = removed.Id },
                 new() { Kind = "notice", Notice = new()
                 {
                     EventId = Identity.EventId(), Op = "rmlibrary", Stage = "outbox", Folders = [removed.Id],
-                    At = now, QueuedAt = now, Life = engine.Life(removed.Id) + 1, SetupHash = setup
+                    At = now, QueuedAt = now, ReadyAt = now, FirstSeenAt = now, Origin = "recovery", Quiet = true, Life = engine.Life(removed.Id) + 1, SetupHash = setup
                 } },
                 new() { Kind = "remove", Tombstone = new(removed.Id, journal.State.Seq + 1, now, engine.Life(removed.Id) + 1) });
         }
@@ -389,42 +613,25 @@ public sealed class NotificationService : BackgroundService
     }
     private sealed class SendSchedule
     {
-        public long Next { get; set; }
+        private long? at;
+        private TimeSpan wait;
         public long LastAttempt { get; set; }
         public int Attempts { get; set; }
+        public bool Due(TimeProvider clock) => at is null || clock.GetElapsedTime(at.Value) >= wait;
+        public void Delay(TimeProvider clock, TimeSpan delay) { at = clock.GetTimestamp(); wait = delay; }
     }
-    private sealed class Scan(Library library, IReadOnlyList<Guid> ids, long seq, State state)
+    private sealed class Scan(Library library, long seq, State state, bool wasCovered, long epoch)
     {
+        public string PassId { get; } = Identity.EventId();
         public Library Library { get; } = library;
-        public IReadOnlyList<Guid> Ids { get; } = ids;
-        public HashSet<Guid> Present { get; } = ids.ToHashSet();
+        public IReadOnlyList<Guid>? Ids { get; set; }
+        public HashSet<string>? Present { get; set; }
+        public Title[]? Removals { get; set; }
+        public int RemovalPosition { get; set; }
         public HashSet<string> Known { get; } = state.DiscoveryKnowledge();
         public long StartSeq { get; } = seq;
+        public bool WasCovered { get; } = wasCovered;
+        public long Epoch { get; } = epoch;
         public int Position { get; set; }
-        public bool Failed { get; set; }
-    }
-}
-
-public static class Heartbeat
-{
-    public static byte[] Encode(string server, State state, long now, string error, bool tooManyUsers, long bytes)
-    {
-        string[] allowed = ["none", "relayUnreachable", "unauthorized", "tooManyUsers", "indexFull", "stateRecovered", "inventoryIncomplete", "itemEvaluationFailed", "reconcileFailed", "invalidConfiguration", "adapterUnavailable", "stateUnavailable"];
-        if (!allowed.Contains(error)) throw new InvalidDataException("Invalid health code");
-        if (tooManyUsers) error = "tooManyUsers"; else if (state.Health.IndexFull) error = "indexFull";
-        using var output = new MemoryStream();
-        using (var w = new Utf8JsonWriter(output))
-        {
-            w.WriteStartObject(); w.WriteNumber("v", 2); w.WriteString("server", server); w.WriteString("version", "1.0.1");
-            w.WriteNumber("outboxDepth", state.Notices.Values.Count(n => n.Stage == "outbox"));
-            w.WriteNumber("oldestPendingAgeS", state.Notices.Count == 0 ? 0 : Math.Max(0, now - state.Notices.Values.Min(n => n.QueuedAt)));
-            w.WriteNumber("droppedSinceLast", state.Health.Dropped);
-            if (state.Health.LastAckAt is { } ack) w.WriteNumber("lastAckAt", ack); else w.WriteNull("lastAckAt");
-            w.WriteString("errorCode", error); w.WriteBoolean("indexFull", state.Health.IndexFull); w.WriteBoolean("tooManyUsers", tooManyUsers);
-            w.WriteNumber("indexCount", state.Index.Count); w.WriteNumber("stateBytes", bytes);
-            w.WriteNumber("baselineLibrariesRemaining", state.Libraries.Values.Count(l => !l.BaselineComplete));
-            w.WriteEndObject();
-        }
-        return output.ToArray();
     }
 }

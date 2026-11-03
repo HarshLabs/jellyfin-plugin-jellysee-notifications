@@ -16,7 +16,7 @@ internal sealed class StateIoWorker : IDisposable
     private int abandoned;
     private int disposed;
     private int cleanupSucceeded;
-    internal bool CanRestart => Volatile.Read(ref abandoned) == 0 && stopped.Task.IsCompleted && Volatile.Read(ref cleanupSucceeded) != 0;
+    internal bool CanRestart => stopped.Task.IsCompleted && Volatile.Read(ref cleanupSucceeded) != 0;
     internal CancellationToken Token => token;
 
     internal StateIoWorker(CancellationToken ct, TimeSpan timeout, Action cleanup)
@@ -74,6 +74,7 @@ internal sealed class StateIoWorker : IDisposable
     {
         lock (stopGate)
         {
+            if (stopped.Task.IsCompleted) return;
             Interlocked.Exchange(ref abandoned, 1);
             lifetime.Cancel();
             work.CompleteAdding();

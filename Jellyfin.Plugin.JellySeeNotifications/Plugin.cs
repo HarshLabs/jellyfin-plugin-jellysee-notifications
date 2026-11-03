@@ -15,14 +15,7 @@ public sealed class PluginConfiguration : BasePluginConfiguration
     public string Secret { get; set; } = "";
     public string RelayOrigin { get; set; } = RelayClient.Origin;
     public List<RetiredCredential> RetiredSecrets { get; set; } = [];
-    // Status contains only bounded health values; the elevated config API is the only reader.
-    public string Status { get; set; } = "notConfigured";
-    public bool IndexFull { get; set; }
-    public bool TooManyUsers { get; set; }
-    public int IndexCount { get; set; }
-    public long StateBytes { get; set; }
-    public int OutboxDepth { get; set; }
-    public int BaselineLibrariesRemaining { get; set; }
+
 }
 public sealed class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
 {
@@ -47,7 +40,8 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
     {
         services.AddSingleton<IJellyfinCompat, JellyfinCompat>();
         services.AddSingleton<RelayClient>();
-        services.AddHostedService<NotificationService>();
+        services.AddSingleton<NotificationService>();
+        services.AddHostedService(provider => provider.GetRequiredService<NotificationService>());
     }
 }
 
@@ -61,18 +55,20 @@ public static class Credentials
 {
     public static List<RetiredCredential> Rotate(PluginConfiguration old, string nextSecret, long now)
     {
-        var retained = (old.RetiredSecrets ?? []).Where(c => c.Secret.Length is > 0 and <= 4096 && c.RetiredAt <= now + 120 && now - c.RetiredAt < 86400 && c.Secret != nextSecret).ToList();
+        var retained = (old.RetiredSecrets ?? []).Where(c => c.Secret.Length is > 0 and <= 4096 && c.RetiredAt >= 0 && now - c.RetiredAt < 86400 && c.Secret != nextSecret).ToList();
         if (old.Secret.Length != 0 && old.Secret != nextSecret)
         {
             retained.RemoveAll(c => c.Secret == old.Secret);
             retained.Add(new() { Secret = old.Secret, RetiredAt = now });
         }
-        return retained.OrderByDescending(c => c.RetiredAt).Take(20).ToList();
+        return retained.OrderByDescending(c => c.RetiredAt).Take(19).ToList();
     }
     public static Dictionary<string, string> Available(PluginConfiguration config, long now)
     {
         var result = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var credential in (config.RetiredSecrets ?? []).Where(c => c.Secret.Length is > 0 and <= 4096 && c.RetiredAt <= now + 120 && now - c.RetiredAt < 86400).Take(20))
+        // A future retirement after a backward clock correction does not establish expiry.
+        // These are already configured credentials, bounded to nineteen, not untrusted wire times.
+        foreach (var credential in (config.RetiredSecrets ?? []).Where(c => c.Secret.Length is > 0 and <= 4096 && c.RetiredAt >= 0 && now - c.RetiredAt < 86400).Take(19))
             result[Identity.Hash(credential.Secret)] = credential.Secret;
         if (config.Secret.Length is > 0 and <= 4096) result[Identity.Hash(config.Secret)] = config.Secret;
         return result;

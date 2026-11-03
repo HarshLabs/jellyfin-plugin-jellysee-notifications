@@ -40,7 +40,7 @@ public sealed class EngineTests
         Assert.Equal("pendingAdd", recovered.State.Notices[Id(100)].Stage);
         fake.HasAudience = true; restored.AdvanceAdds(500, _ => { });
         var notice = Assert.Single(recovered.State.Notices).Value; Assert.Equal(Id(100), notice.EventId); Assert.Equal("outbox", notice.Stage);
-        Assert.Equal(500, notice.At); Assert.Single(recovered.State.Index);
+        Assert.Equal(500, notice.At); Assert.Equal(500, notice.ReadyAt); Assert.Single(recovered.State.Index);
     }
     [Fact] public void AudienceTimeoutDropsAndReportsInsteadOfSending()
     {
@@ -49,14 +49,14 @@ public sealed class EngineTests
         engine.QueueAdd(Id(1), "Movie", Id(100), 100, ""); engine.AdvanceAdds(1900, _ => { });
         Assert.Empty(journal.State.Notices); Assert.Equal(1, journal.State.Health.Dropped);
     }
-    [Fact] public void UpgradeSuppressesOnlyRemovalAndStillAdvancesLifecycle()
+    [Fact] public void ObservedReplacementIsQuietAndStillAdvancesLifecycle()
     {
         using var temp = new TempDirectory(); using var journal = new Journal(temp.Path);
         var fake = new FakeCompat(); fake.Add(1); var engine = new Engine(journal, fake, "key");
         engine.Index(fake.Get(Id(1))!); engine.Remove(Id(1), Id(100), 1000, "");
         engine.QueueAdd(Id(1), "Movie", Id(101), 1001, ""); engine.AdvanceAdds(1002, _ => { }); engine.AdvanceRemovals(1600, _ => { });
-        Assert.DoesNotContain(journal.State.Notices.Values, n => n.Op == "rm");
-        var add = Assert.Single(journal.State.Notices).Value; Assert.Equal("add", add.Op); Assert.Equal(1, add.Life);
+        Assert.All(journal.State.Notices.Values, n => Assert.True(n.Quiet));
+        var add = Assert.Single(journal.State.Notices.Values, n => n.Op == "add"); Assert.Equal("add", add.Op); Assert.Equal(1, add.Life);
         Assert.Equal(1, journal.State.Index[Id(1)].Life);
     }
     [Fact] public void UnreadyReplacementSuppressesRemovalBeforeTheFifteenMinuteFallbackAcrossRestart()
@@ -74,13 +74,26 @@ public sealed class EngineTests
         }
         using var restored = new Journal(temp.Path); var resumed = new Engine(restored, fake, "key");
         resumed.AdvanceRemovals(1600, _ => { });
-        Assert.DoesNotContain(restored.State.Notices.Values, n => n.Op == "rm");
-        Assert.Equal("pendingAdd", Assert.Single(restored.State.Notices.Values).Stage);
+        Assert.All(restored.State.Notices.Values.Where(n => n.Op == "rm"), n => Assert.True(n.Quiet));
+        Assert.Equal("pendingAdd", Assert.Single(restored.State.Notices.Values, n => n.Op == "add").Stage);
         resumed.AdvanceAdds(1901, _ => { });
-        var add = Assert.Single(restored.State.Notices.Values); Assert.Equal("add", add.Op); Assert.Equal("outbox", add.Stage); Assert.Equal(Id(101), add.EventId);
+        var add = Assert.Single(restored.State.Notices.Values, n => n.Op == "add"); Assert.Equal("add", add.Op); Assert.Equal("outbox", add.Stage); Assert.Equal(Id(101), add.EventId);
         Assert.Equal(1, resumed.Life(Id(1)));
     }
-    [Fact] public void UnreadyReplacementInAnotherLibraryDoesNotSuppressRemoval()
+    [Fact] public void QuietMoveSurvivesRemovalAcknowledgementBeforeMetadataReadinessAndRestart()
+    {
+        using var temp = new TempDirectory(); var fake = new FakeCompat { Refreshed = false }; fake.Add(1); fake.Add(2);
+        using (var journal = new Journal(temp.Path))
+        {
+            var engine = new Engine(journal, fake, "key"); engine.Index(fake.Get(Id(1))!);
+            engine.Remove(Id(1), Id(100), 1000, ""); engine.QueueAdd(Id(2), "Movie", Id(101), 1001, ""); engine.AdvanceAdds(1002, _ => { });
+            engine.AdvanceRemovals(1600, _ => { }); engine.Acknowledge([Id(100)], 1601); journal.Compact();
+        }
+        using var restored = new Journal(temp.Path); var resumed = new Engine(restored, fake, "key"); resumed.AdvanceAdds(1901, _ => { });
+        var addition = Assert.Single(restored.State.Notices.Values); Assert.Equal("outbox", addition.Stage); Assert.True(addition.Quiet);
+    }
+
+    [Fact] public void UnreadyReplacementInAnotherLibraryPreservesQuietRemovalHint()
     {
         using var temp = new TempDirectory(); using var journal = new Journal(temp.Path);
         var fake = new FakeCompat { Refreshed = false }; fake.Add(1); fake.Add(2); var engine = new Engine(journal, fake, "key");
@@ -89,7 +102,7 @@ public sealed class EngineTests
         Assert.Contains(journal.State.Notices.Values, n => n.Op == "rm" && n.Stage == "outbox");
         Assert.Contains(journal.State.Notices.Values, n => n.Op == "add" && n.Stage == "pendingAdd");
     }
-    [Fact] public void MoveBetweenLibrariesDoesNotSuppressRemoval()
+    [Fact] public void MoveBetweenLibrariesPreservesQuietMembershipHints()
     {
         using var temp = new TempDirectory(); using var journal = new Journal(temp.Path);
         var fake = new FakeCompat(); fake.Add(1); var engine = new Engine(journal, fake, "key");

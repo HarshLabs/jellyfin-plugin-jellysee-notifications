@@ -33,24 +33,39 @@ public sealed class Journal : IDisposable
     public Journal(string directory, string? pluginDataPath = null)
         : this(directory, pluginDataPath, CancellationToken.None, StateIoWorker.DefaultTimeout) { }
 
-    internal Journal(string directory, string? pluginDataPath, CancellationToken ct, TimeSpan timeout)
+    internal Journal(string directory, string? pluginDataPath, CancellationToken ct, TimeSpan timeout, StateOwnership? ownership = null, bool versioned = false)
     {
-        io = new StateIoWorker(ct, timeout, () => { writer?.Dispose(); files?.Dispose(); });
+        io = new StateIoWorker(ct, timeout, () => { try { writer?.Dispose(); } finally { files?.Dispose(); } });
+        ownership?.Attach(io);
         try
         {
             io.Invoke(() =>
             {
+                string original = directory;
+                if (versioned) directory = Path.Combine(directory, "v4");
                 files = new StateDirectory(directory, pluginDataPath ?? Path.GetDirectoryName(Path.GetFullPath(directory))!, io.Token);
-                Load(); writer!.Seek(0, SeekOrigin.End);
+                if (versioned && files.Length("migration.complete") == 0)
+                {
+                    using var source = new StateDirectory(original, pluginDataPath ?? Path.GetDirectoryName(Path.GetFullPath(original))!, io.Token);
+                    foreach (string name in new[] { "snapshot.bin", "journal.ndjson" })
+                    {
+                        using var old = source.Read(name);
+                        if (old is not null) { if (old.Length > MaxFile) throw new InvalidDataException("Migration cap"); using var copy = files.Rewrite(name, old, old.Length); }
+                    }
+                    // Publish only after a complete imported snapshot. A failed import is retried from untouched v3 files.
+                    Load();
+                    foreach (var n in State.Notices.Values.ToArray()) State.Apply(new() { Kind = "notice", Notice = n with { Origin = "recovery", FirstSeenAt = n.FirstSeenAt == 0 ? n.QueuedAt : n.FirstSeenAt } });
+                    CompactCore();
+                    using var marker = files.Rewrite("migration.complete", null, 0); marker.WriteByte(1); marker.Flush(true);
+                }
+                else Load(); writer!.Seek(0, SeekOrigin.End);
             });
         }
-        catch (Exception ex)
+        catch
         {
             io.Dispose();
             ct.ThrowIfCancellationRequested();
             // A new worker is safe only once the old worker closed every handle.
-            if (StateFailure.IsSharing(ex) && !io.CanRestart)
-                throw new StatePersistenceException(new TimeoutException());
             throw;
         }
     }

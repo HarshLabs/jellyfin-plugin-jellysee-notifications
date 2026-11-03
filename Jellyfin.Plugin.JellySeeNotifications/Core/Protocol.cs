@@ -20,6 +20,7 @@ public static class Identity
     }
     public static string Hash(string text) => Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(text)));
     public static string UserHash(string serverKey, Guid user) => Hash("jellysee-user-v1:" + serverKey + ":" + user.ToString("N"))[..16];
+    public static string PresentationKey(string serverKey, string profile) => "r:" + Hash("jellysee-recovery-v1:" + serverKey + ":" + profile)[..32];
     public static string EventId() => Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16));
     public static bool IsId(string? value) => value is { Length: 32 } && value.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f');
 }
@@ -36,7 +37,21 @@ public sealed record Notice
     public int Count { get; init; }
     public int Life { get; init; }
     public long QueuedAt { get; init; }
+    public long EnqueuedSeq { get; init; }
     public long At { get; init; }
+    private readonly long? readyAt;
+    public long ReadyAt { get => readyAt ?? QueuedAt; init => readyAt = value; }
+    public string Origin { get; init; } = "recovery";
+    private readonly long? firstSeenAt;
+    public long FirstSeenAt { get => firstSeenAt ?? QueuedAt; init => firstSeenAt = value; }
+    public bool Quiet { get; init; }
+    public bool Folded { get; init; }
+    public long OutageStart { get; init; }
+    public string? OutageId { get; init; }
+    public string? Profile { get; init; }
+    public string? PresentationKey { get; init; }
+    public long HoldUntil { get; init; }
+    public bool HoldForScan { get; init; }
     [System.Text.Json.Serialization.JsonConverter(typeof(AudienceConverter))]
     public string[] Audience { get; init; } = [];
     public string Stage { get; init; } = "pendingAdd";
@@ -69,7 +84,7 @@ public static class Wire
         using var stream = new MemoryStream();
         using (var w = new Utf8JsonWriter(stream))
         {
-            w.WriteStartObject(); w.WriteNumber("v", 2); w.WriteString("server", server);
+            w.WriteStartObject(); w.WriteNumber("v", 3); w.WriteString("server", server);
             w.WriteBase64String("users", users.SelectMany(Convert.FromHexString).ToArray());
             w.WriteStartArray("events");
             foreach (var e in events)
@@ -77,10 +92,13 @@ public static class Wire
                 Validate(e);
                 w.WriteStartObject(); w.WriteString("e", e.EventId); w.WriteString("op", e.Op);
                 w.WriteNumber("life", e.Life); w.WriteNumber("at", e.At);
+                w.WriteString("origin", e.Origin); w.WriteNumber("firstSeenAt", e.FirstSeenAt);
+                if (e.Quiet) w.WriteBoolean("quiet", true);
+                if (e.Op == "summary") { w.WriteNumber("outageStart", e.OutageStart); w.WriteString("profile", e.Profile); w.WriteString("presentationKey", e.PresentationKey); }
                 if (e.Op != "rmlibrary") w.WriteBase64String("a", Bitmap(users, e.Audience));
                 if (e.Op is "add" or "rm") { w.WriteString("id", e.Id); w.WriteString("t", e.Type); }
                 if (e.Op == "add" && e.Series is not null) w.WriteString("s", e.Series);
-                if (e.Op != "add")
+                if (e.Op is not ("add" or "summary"))
                 {
                     w.WriteStartArray("f"); foreach (var f in e.Folders) w.WriteStringValue(f); w.WriteEndArray();
                 }
@@ -94,15 +112,16 @@ public static class Wire
 
     public static void Validate(Notice e)
     {
-        if (!Identity.IsId(e.EventId) || e.Life < 0 || e.At < 0 || e.QueuedAt < 0 || e.Folders.Length > 4 || e.Folders.Any(f => !Identity.IsId(f)))
+        if (!Identity.IsId(e.EventId) || e.Life < 0 || e.At < 0 || e.QueuedAt < 0 || e.FirstSeenAt < 0 || e.Origin is not ("live" or "recovery") || e.Folders.Length > 4 || e.Folders.Any(f => !Identity.IsId(f)))
             throw new InvalidDataException("Invalid event");
         if (e.Op is "add" or "rm")
         {
             if (!Identity.IsId(e.Id) || !Types.Contains(e.Type)) throw new InvalidDataException("Invalid title");
         }
-        else if (e.Op is not ("rmbulk" or "rmlibrary")) throw new InvalidDataException("Invalid op");
+        else if (e.Op is not ("rmbulk" or "rmlibrary" or "summary")) throw new InvalidDataException("Invalid op");
         if (e.Op is "rmbulk" or "rmlibrary" && e.Folders.Length != 1) throw new InvalidDataException("Invalid folder");
         if (e.Op == "rmbulk" && e.Count < 1) throw new InvalidDataException("Invalid count");
+        if (e.Op == "summary" && (e.Origin != "recovery" || !Binding.ValidProfile(e.Profile) || e.OutageStart < 0 || e.PresentationKey is not { Length: 34 } || !e.PresentationKey.StartsWith("r:", StringComparison.Ordinal) || !Identity.IsId(e.PresentationKey[2..]))) throw new InvalidDataException("Invalid summary");
         if (e.Series is not null && !Identity.IsId(e.Series)) throw new InvalidDataException("Invalid series");
         if (e.Audience.Length > MaxUsers || e.Audience.Any(u => u.Length != 16 || u.Any(c => c is not (>= '0' and <= '9' or >= 'a' and <= 'f'))))
             throw new InvalidDataException("Invalid audience");
@@ -180,7 +199,7 @@ public sealed class RelayClient : IDisposable
     public RelayClient(HttpMessageHandler handler) => client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(10) };
     public static Uri Destination(string origin, string serverKey, string route)
     {
-        if (origin != Origin || !serverKey.StartsWith("s1-", StringComparison.Ordinal) || serverKey.Length != 67 || !serverKey[3..].All(Uri.IsHexDigit) || route is not ("events" or "heartbeat"))
+        if (origin != Origin || !serverKey.StartsWith("s1-", StringComparison.Ordinal) || serverKey.Length != 67 || !serverKey[3..].All(Uri.IsHexDigit) || route is not ("events" or "heartbeat" or "bindings"))
             throw new InvalidDataException("Relay origin is not allowlisted");
         return new Uri(origin + "/v1/jellyfin/" + serverKey + "/" + route);
     }

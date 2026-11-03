@@ -354,7 +354,7 @@ public sealed class SecurityRegressionTests
         string root = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../.."));
         var net9 = AssemblyName.GetAssemblyName(Path.Combine(root, "Jellyfin.Plugin.JellySeeNotifications/bin/Release/net9.0/Jellyfin.Plugin.JellySeeNotifications.dll")).Version;
         var net10 = typeof(Engine).Assembly.GetName().Version;
-        Assert.Equal(new Version(1, 0, 1, 0), net9); Assert.Equal(new Version(1, 0, 1, 1), net10); Assert.True(net10 > net9);
+        Assert.Equal(new Version(1, 1, 0, 0), net9); Assert.Equal(new Version(1, 1, 0, 1), net10); Assert.True(net10 > net9);
     }
     // Fixture creation only. No handwritten native calls in either assembly.
     private static void CreateHardLink(string path, string target)
