@@ -59,14 +59,14 @@ compaction and DiskBytes) is dispatched to one dedicated background thread.
 Each call has a ten-second deadline covering the whole operation, a stricter
 bound than a separate ten seconds for each open/read. The service's shutdown
 token also cancels the caller's wait. Journal handles, including their eventual
-disposal, stay on that thread. Timeouts permanently abandon the worker: subsequent
-calls fail immediately, the service disables callbacks, removes subscriptions
-and ends notification processing without retrying the path. The dashboard is set
-to the fixed `stateUnavailable` code even when notifications are disabled. When
-configured and not shutting down, the service attempts one ordinary ten-second
-heartbeat with that code, using empty state counters rather than accessing state
-still owned by the abandoned worker. A failed heartbeat does not overwrite the
-dashboard code and is not retried.
+disposal, stay on that thread. A timeout abandons calls into that worker and
+uncovers its libraries. The supervisor retains a separate ownership token even
+if Journal construction fails: it reports `restartRequired` until the operation
+and all cleanup complete successfully, then reopens and replays automatically.
+Failed cleanup never permits a second writer. Independent ten-minute heartbeats
+read the last immutable runtime snapshot, including last-known counters, without
+accessing an abandoned journal. Runtime diagnostics are no longer saved in plugin
+configuration.
 
 Managed .NET APIs cannot reliably establish that a Unix entry is a regular file:
 a FIFO can have `FileAttributes.Normal` and no LinkTarget. Device/ReparsePoint/
@@ -81,44 +81,29 @@ filesystem call returns. It is never joined on shutdown; cleanup runs on that
 thread if it returns. Cancellation checks prevent later path operations after
 abandonment, but an already active call may still finish, including a write.
 Normal disposal waits at most ten seconds for handles to close; cancellation
-releases that wait immediately. Slow regular-file operations exceeding the
-deadline also disable notifications and require a server restart after the
-storage problem is resolved. There is at most one abandoned I/O thread per
-service instance; abandoned workers are never automatically restarted.
+releases that wait immediately. A blocked worker is never replaced while it owns
+state, but eventual clean completion permits automatic reopening. Heartbeats and
+the diagnostics lane continue independently.
 
 `DiskBytes` now uses refreshed `FileInfo.Length` metadata through the existing
 containment/link checks, with no reader open. A FIFO size probe consequently
 returns metadata without waiting for a peer. This does not establish regular-file
 identity; actual startup/replay reads remain protected by the same deadline.
 
-Completed I/O failures with Windows sharing/lock HResults `80070020` and
-`80070021` are retryable. Windows overwrite-move failures with `80070005`
-(access denied) are also marked retryable at that operation only: MoveFileEx
-can report this for a transient destination lock despite Delete sharing
-([dotnet/runtime#114230](https://github.com/dotnet/runtime/issues/114230)).
-An actual permission problem at that move will likewise keep retrying until
-resolved or shutdown. Access denial outside overwrite-move remains terminal. After normal disposal confirms
-the old worker finished all cleanup, the service reopens/replays on a new worker.
-It never retries an append transaction in place: an error during write/flush may
-have left a durable full or partial record. Replay validates and repairs that
-prefix before resuming. Retry delays increase from one to sixty seconds and
-remain cancellable, with callbacks disabled and subscriptions removed between
-attempts. The bounded callback channel survives retries; callbacks missed while
-disabled use startup reconciliation as their catch-up path. Other I/O failures,
-failed/stalled cleanup and timeouts stay terminal. Each failed attempt sets the
-dashboard health. When configured, the first failure in a streak attempts the
-existing bounded heartbeat; further attempts are at least fifteen minutes apart,
-including when the response fails or is lost. This preserves room in the relay's
-12/hour/setup heartbeat budget for the immediate normal heartbeat after recovery;
-the failure-report cooldown does not gate normal heartbeats. Retryable failures
-log on the first failure and at most once per hour thereafter. Terminal failures
-always log. The cooldowns use monotonic time, so wall-clock corrections do not
-cause a burst of reports. A full successful journal iteration (including size
-probes and any compaction) resets the backoff and report streak; opening the
-journal alone does not. Shutdown cancellation takes precedence over incomplete
-cleanup checks and failure reporting, so it does not appear as a timeout error.
-Logs include a fixed message plus the underlying exception type and HResult,
-without exception objects, messages, paths or IDs.
+Every completed I/O failure is supervised, including non-sharing failures.
+After cleanup proves ownership released, the service reopens/replays on a new
+worker; it never repeats an ambiguous append transaction in place. Retry delays
+increase from one second to five minutes and remain cancellable. Callbacks are
+disabled and subscriptions removed between sessions; reconciliation recovers
+missed changes. Logs are throttled hourly by cause and contain exception type
+and HResult only. A successful complete iteration resets retry backoff. One
+supervisor-owned monotonic limiter caps all heartbeat attempts at twelve/hour
+and honors relay backoff across worker sessions.
+
+Production writes format-v4 state below `v4/`. Import validates copies of the old
+files and keeps those originals unchanged for downgrade. The migration marker is
+published only after a complete imported snapshot. See the reliability plan's
+Decisions for the downgrade/re-upgrade workflow.
 
 All readers use `FileAccess.Read` and `FileShare.Read | FileShare.Delete`;
 new writers retain `ReadWrite` access and `Read | Delete` sharing. No plugin path
@@ -142,7 +127,8 @@ Unix FIFO regressions cover each active filename during construction, metadata
 size probes without an open, timeout health on the dashboard/heartbeat, prompt
 host startup, and shutdown cancellation before a much longer I/O deadline. FIFO cases are
 skipped on Windows. Portable worker tests verify dedicated background execution,
-terminal timeout/cancellation and detached cleanup after a blocked call returns.
+timeout/cancellation containment and detached cleanup after a blocked call returns.
+Reliability regressions cover ownership-gated reopening and independent heartbeat health.
 
 ## Temporary-file recovery
 
@@ -152,7 +138,8 @@ fails. Cleanup never masks the original persistence error. If permissions or a
 directory substitution prevent cleanup, the next startup retries it.
 
 Startup examines at most 128 matching entries across these prefixes:
-`snapshot.tmp.`, `journal.ndjson.tmp.` and `snapshot.bin.corrupt.tmp.`. It only
+`snapshot.tmp.`, `journal.ndjson.tmp.` and `snapshot.bin.corrupt.tmp.`, `migration.complete.tmp.` and
+`diagnostics.ndjson.tmp.`. It only
 deletes names ending in exactly a 32-hex-digit GUID. It does not read stale
 contents or recurse. Deleting a file symlink or hardlink only removes that entry.
 Unexpected directories (including directory reparse points) stop recovery

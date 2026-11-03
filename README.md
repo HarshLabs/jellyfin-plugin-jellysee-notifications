@@ -1,12 +1,12 @@
 # JellySee Notifications
 
-Jellyfin plugin release 1.0.1.0 for audience-scoped library notifications in JellySee.
+Jellyfin plugin release 1.1.0.0 for audience-scoped library notifications in JellySee.
 Separate binaries support Jellyfin **10.11** (.NET 9, Controller/Model 10.11.8)
 and **12** (.NET 10, Controller/Model 12.0.0-rc3). The 10.11 DLL/package version is
-**1.0.1.0**; the 12 DLL/package version is **1.0.1.1**, so upgrading the server
+**1.1.0.0**; the 12 DLL/package version is **1.1.0.1**, so upgrading the server
 also offers a strictly newer compatible plugin. Jellyfin 10.10 is unsupported.
-Version 1.0.1 fixes Windows state-file sharing during size probes and adds
-sharing-error recovery and validation across all six OS/architecture combinations.
+Version 1.1.0 adds supervised recovery, independent v3 health, entitled outage
+summaries, quiet moves and authenticated recipient binding.
 See [the changelog](CHANGELOG.md).
 
 ## Configuration
@@ -22,7 +22,23 @@ The only allowlisted origin is compiled into the DLL:
 `https://jellysee-relay.harshlabsllc.workers.dev`. The configuration's origin field
 cannot redirect traffic elsewhere. HTTPS uses platform TLS validation, redirects
 are disabled, and each full request (including its response-body read) has a ten-second deadline.
-No controller or other inbound API is registered.
+Authenticated endpoints are registered under `/JellySeeNotifications`:
+
+- `POST /Bind`: `{"registration":"<32 lowercase hex>","profile":"profile-id"}`.
+  The user comes only from the signed-in Jellyfin session. Approved tuples persist
+  across restarts and are reported through the authenticated setup channel.
+  Retention is 64 registrations per user/setup and 500 per setup; admission only
+  evicts the requesting user's own oldest registration and rejects cross-user replacement.
+- `GET /Health`: exactly `{"health":"healthy"|"not","setupId":"<64 hex>"}`,
+  for any signed-in user. Apps cache proof for at most ten minutes and only
+  suppress polling alerts for this same setup. Public relay status is informational.
+- `GET /Diagnostics`: Jellyfin `RequiresElevation` policy, used by the config
+  page for runtime status and the fixed-code, bounded diagnostics ring.
+
+Capable apps register `CAP_SUMMARY = 4` and bind after every successful relay
+registration, including weekly refresh and user/profile changes. Summary envelopes
+use the contract's unchanged server/profile presentation key and open Recently Added.
+Old apps receive no unsupported summary operation or recovery wake.
 
 ## Behaviour
 
@@ -33,8 +49,11 @@ thirty minutes. Disabled users are excluded. Addition audiences require both
 there is no additional interpretation of library allowlists or blocklists.
 Removal audiences use current access to the indexed logical libraries.
 
-A single background loop owns all disk, library-query and HTTP work. Callbacks
-only put constant-size signals with random occurrence IDs into a bounded channel.
+One processing loop owns notification state. Callbacks enqueue bounded signals
+with immutable receipt time and coverage. Census and live metadata calls run on
+two fixed, bounded threads; Ids has a 120-second deadline and other calls fifteen
+seconds. Pending calls yield the processing slice, whose work budget is two seconds.
+A separate heartbeat lane continues through blocked library, sender and state work.
 The durable journal records transitions before changing the index. Checksums,
 streaming reads, per-record limits, an atomic snapshot rename and a complete
 snapshot footer handle crashes and corruption. Journal corruption truncates the
@@ -51,42 +70,31 @@ files, and bounded startup recovery reclaims abandoned random temporary entries.
 Transient adapter/database failures retain the loop, subscriptions and
 scan progress, report `adapterUnavailable`, and retry with exponential delays
 from one to sixty seconds. Shutdown cancellation remains separate.
-State I/O runs on a dedicated background thread with a ten-second deadline per
-journal operation, including initialization, reads and size probes. The service
-yields before I/O so .NET 9 host startup can complete promptly. A stalled open or
-read (including a Unix FIFO), or a persistence failure, stops notification work
-and reports `stateUnavailable` on the dashboard. When configured, it attempts one
-bounded heartbeat with that code. It never retries the blocked path; shutdown
-cancels the caller's wait without joining the blocked background thread. Managed
-APIs cannot interrupt that thread's filesystem call; it can remain until process
-exit or the call returns. Completed Windows sharing/lock violations (HResults
-`80070020`/`80070021`, plus access denial specifically during an overwrite-move)
-instead close the worker, reopen and replay durable state,
-and retry with delays from one to sixty seconds until access recovers or shutdown.
-A full successful journal iteration resets that backoff and ends the failure
-streak; merely reopening does not. Retry streaks send an outage heartbeat on the
-first failure and at most once every fifteen minutes thereafter, leaving room in
-the relay budget for the immediate normal heartbeat after recovery. Persistent
-retry errors log once initially and at most hourly; terminal errors always log.
-Shutdown cancellation produces no state-failure diagnostic or heartbeat.
-A worker whose cleanup fails or stalls cannot be reopened. Size probes use checked
-file metadata without opening a reader against the live journal writer.
-Startup replay closes its source reader before replacing the journal; compaction
-closes the old writer after snapshot publication and before journal replacement.
-This avoids Windows overwrite-moves onto owned open destinations.
-`stateUnavailable` logs contain only a fixed message, exception type and HResult;
-exception text, paths and IDs are never printed.
+State I/O runs on a dedicated thread with a ten-second deadline per operation.
+Host startup yields before I/O. Every state failure is supervised: after proven
+cleanup, reopen and replay with backoff from one second to five minutes. If an
+operation or cleanup remains outstanding, report `restartRequired`, retain the
+last-known counters, and reopen automatically only after clean completion. There
+is never a second state writer. Shutdown does not join a blocked filesystem call.
+Logs contain fixed codes, exception type and HResult only; diagnostics contain
+UTC, monotonic time and fixed cause codes, with a 256 KiB cap and independent I/O.
+Runtime health and counters are separate from saved configuration.
+
+New state lives under `v4/`; migration keeps the old journal/snapshot untouched
+for downgrade and treats missing provenance as recovery. Re-upgrade resumes v4.
+See [storage details](docs/state-storage.md) for containment, atomic replacement,
+recovery and residual filesystem limits.
 
 An initial baseline indexes existing titles without announcing historical imports.
 It resumes from persisted discovery knowledge after a restart. Each library has
 one unpaged, server-wide, ids-only `GetItemIds` query using its physical roots;
 only logical CollectionFolder IDs appear in events. Passes run at startup and
-on a fifteen-minute schedule, with library queries spaced five seconds apart.
+on a fifteen-minute schedule.
 Timer, inventory and dirty requests coalesce into a follow-up pass while the
 current scan and its unvisited libraries finish, even if a pass exceeds fifteen minutes.
-Each tick processes up to 1,000 titles and index writes are committed in groups
-of up to 100 changes. Container changes trigger an all-library pass within a
-coalesced thirty-second window; an active pass finishes before the follow-up begins. Every regular pass also refreshes folder and
+Each slice processes up to 1,000 titles within its elapsed budget. Container
+changes request a coalesced follow-up pass; the active pass and unvisited tail
+retain their cursors. Every regular pass also refreshes folder and
 provider fingerprints, covering the daily full-reconcile requirement.
 
 Library inventory is checked every two minutes using `GetVirtualFolders()` plus
@@ -96,16 +104,23 @@ with equal location sets preserve continuity; unchanged libraries sharing paths
 cannot conceal a deleted library. A library disappearance journals one
 `rmlibrary` and removes its route from the index in the same transaction.
 
-Every processed title removal increments its lifecycle counter, including an
-upgrade whose removal is suppressed. Tombstones last twenty-four hours; lifecycle counters persist after tombstones expire. A removal
-waits ten minutes for an equal, nonempty provider fingerprint, type and folder set
-on an addition within ten minutes in either direction. Replacement fingerprints
-are persisted before metadata readiness, both in bounded history and on the
-pending addition, so the fifteen-minute fallback or history eviction cannot
-release a matching upgrade removal. The addition is always retained. More than 200 unsuppressed removals in a ten-minute window produce one
-`rmbulk` for each affected library, with its own audience. Bulk windows wait for
-their newest member's upgrade hold to finish; this can add up to ten minutes to
-the removal delay. Shared-library removals retain each library's route.
+Coverage requires a complete, successful, durably committed pass in the current
+subscribed worker session. Drops, failed/incomplete censuses, required-call
+failures and restarts uncover libraries. Callbacks received uncovered are recovery;
+reconcile discoveries are live only with covered membership and a previous complete
+pass no more than thirty minutes old. `FirstSeenAt` never changes during retries.
+Recovery and expired additions produce one generic, currently entitled summary per
+outage and bound profile, with no counts or titles. Empty/removals-only recovery is
+silent. Summary entitlement is checked again on every submission/retry.
+
+Title removals advance lifecycles, with twenty-four-hour tombstones and retained
+lifecycle counters. Equal nonempty type/provider fingerprints become quiet only
+when an actual removal is observed within the symmetric ten-minute move window.
+Matching additions are held until a running scan ends (at most thirty minutes),
+or for the move window when no scan is running. Unremoved copies/editions alert
+normally, subject to the thirty-minute audible deadline. ItemUpdated re-evaluates
+pending readiness immediately; the thirty-second tick remains the backstop.
+Bulk removal windows retain their per-library audiences.
 
 The sender flushes after sixty seconds of quiet or five minutes from the oldest
 pending occurrence. Batches contain at most fifty events and 48 KiB of encoded
@@ -114,11 +129,13 @@ LSB-first bitmap. Audiences older than twenty minutes, or more than two minutes
 in the future, are re-evaluated before sending. Only acknowledgement IDs present
 in the request retire outbox entries. Response reads are limited to 16 KiB and
 acknowledgements have a strict schema. Network errors, 429 and 5xx back off with
-jitter and respect Retry-After. Other HTTP failures pause that setup until a
-configuration change; its unacknowledged work remains until expiry. Work expires twenty-four hours after queuing.
-The sender permits at most twenty event requests per sliding minute. Health is
-sent on start/configuration change and every six hours; failed heartbeats retry
-no faster than five minutes.
+jitter and respect Retry-After. Other HTTP failures re-probe after fifteen minutes, honoring longer relay backoff;
+a configuration change or success resets the schedule. Work expires twenty-four hours after queuing.
+Events and bindings share twenty requests per sliding minute. Independent v3
+heartbeats run every ten minutes with a twenty-minute lease, progress, boot id,
+real assembly version, current verified admin hashes and last-known counters.
+One monotonic limiter caps all attempts at twelve/hour across worker sessions.
+Individual alerts expire thirty minutes after observation for every audience.
 
 ## Bounds and known losses
 
@@ -153,7 +170,7 @@ discovery knowledge. Queue overflow, an outage beyond twenty-four hours, index
 capacity, or an unresolvable library configuration can delay or lose alerts; the
 app's own library checks remain the catch-up path. A removal shortly after a
 library path change can use the old indexed libraries for up to fifteen minutes.
-Renames and moves otherwise follow Jellyfin's removal/addition semantics.
+Observed matching moves are quiet; unobserved changes use the recovery rules.
 
 ## Trust boundary and privacy
 
@@ -190,7 +207,7 @@ relay is needed. Tests use fake transports and library adapters; no HTTP is sent
 To prepare archives after a Release build:
 
 ```sh
-python3 scripts/package.py --version 1.0.1.0 --notes path/to/release-notes.txt
+python3 scripts/package.py --version 1.1.0.0 --notes path/to/release-notes.txt
 ```
 
 The package contains the plugin DLL, `meta.json` and license; it excludes Jellyfin

@@ -31,7 +31,7 @@ jobs:
         with:
           python-version: '3.13'
       - run: dotnet restore --locked-mode
-      - run: dotnet build -c Release --no-restore
+      - run: dotnet build -c Release --no-restore -warnaserror
       - run: dotnet test -c Release --no-build --no-restore
       - run: python -m unittest discover -s scripts -p 'test_*.py'
   build:
@@ -71,7 +71,7 @@ jobs:
         with:
           python-version: '3.13'
       - run: dotnet restore --locked-mode
-      - run: dotnet build -c Release --no-restore
+      - run: dotnet build -c Release --no-restore -warnaserror
       - run: dotnet test -c Release --no-build --no-restore
       - run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - run: python3 scripts/package.py --version "$RELEASE_VERSION" --notes release-notes.txt
