@@ -55,6 +55,14 @@ public sealed class Engine
             Drop(Oldest(outbox).EventId);
         journal.Commit(new Change() { Kind = "notice", Notice = notice });
     }
+    internal IEnumerable<Notice> SubmittableNotices()
+    {
+        // Quiet repairs must follow the original's durable acknowledgement (or retirement),
+        // even if their metadata became ready first or dictionary/snapshot order changes.
+        var first = State.Notices.Values.Where(n => n.Op == "add").GroupBy(n => (n.Id, n.SetupHash))
+            .ToDictionary(g => g.Key, g => g.Min(n => n.EnqueuedSeq));
+        return State.Notices.Values.Where(n => n.Op != "add" || !n.Quiet || n.EnqueuedSeq <= first[(n.Id, n.SetupHash)]);
+    }
     private void PutRestoredAdd(Notice original, Notice hint)
     {
         // Both are pending adds. Publish one transaction so replay sees both or neither.
@@ -99,7 +107,7 @@ public sealed class Engine
         else
             // Always repair membership separately: callback receipt time cannot prove whether
             // a removal drained while its metadata read was pending. The original retry stays idempotent.
-            PutRestoredAdd(notice, notice with { EventId = eventId == notice.EventId ? Identity.EventId() : eventId, Origin = origin, FirstSeenAt = now, Quiet = true, Folded = false, OutageId = null });
+            PutRestoredAdd(notice, notice with { EventId = eventId == notice.EventId ? Identity.EventId() : eventId, Life = Life(id), Origin = origin, FirstSeenAt = now, Quiet = true, Folded = false, OutageId = null });
         if (!readd && (origin == "recovery" || folded))
         {
             try

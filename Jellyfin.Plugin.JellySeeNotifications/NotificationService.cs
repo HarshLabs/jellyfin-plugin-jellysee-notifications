@@ -600,7 +600,7 @@ public sealed class NotificationService : BackgroundService
                 }
                 // A summary waits for its profile's approvals present at creation. Later registration
                 // churn cannot move that finite barrier; legacy events do not depend on bindings.
-                var group = journal.State.Notices.Values.Where(n => n.Stage == "outbox" && (n.Op != "summary" || journal.State.Recoveries.Values.Any(r => r.Id == n.OutageId && r.Emitted) &&
+                var group = engine.SubmittableNotices().Where(n => n.Stage == "outbox" && (n.Op != "summary" || journal.State.Recoveries.Values.Any(r => r.Id == n.OutageId && r.Emitted) &&
                         !journal.State.Bindings.Values.Any(b => b.SetupHash == n.SetupHash && b.Profile == n.Profile && b.Sequence <= n.EnqueuedSeq && !reportedBindings.Contains(ReportKey(b)) && !resolvedBindings.Contains(ReportKey(b)))) &&
                         !Rules.Expired(n, now) && credentials.ContainsKey(n.SetupHash))
                     .GroupBy(n => n.SetupHash).Where(g => schedules[g.Key].Due(timeProvider)).OrderBy(g => schedules[g.Key].LastAttempt).FirstOrDefault();

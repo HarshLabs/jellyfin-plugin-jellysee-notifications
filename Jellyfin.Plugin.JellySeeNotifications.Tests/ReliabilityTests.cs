@@ -95,6 +95,7 @@ public sealed class ReliabilityTests
         resumed.QueueAdd(Id(1), "Movie", Id(102), 1003, Setup); resumed.AdvanceAdds(1004, _ => { }); resumed.AdvanceRemovals(1700, _ => { });
         var original = Assert.Single(reopened.State.Notices.Values, n => n.EventId == Id(100));
         Assert.Equal(2, reopened.State.Notices.Count); Assert.True(reopened.State.Notices[Id(102)].Quiet);
+        Assert.Equal(1, original.Life); Assert.Equal(1, reopened.State.Notices[Id(102)].Life);
         Assert.Equal(Id(100), original.EventId); Assert.Equal(1000, original.FirstSeenAt); Assert.Equal("outbox", original.Stage); Assert.False(original.Quiet);
         resumed.Acknowledge([Id(100)], 1701);
         resumed.Remove(Id(1), Id(103), 1702, Setup); resumed.QueueAdd(Id(1), "Movie", Id(104), 1703, Setup); resumed.AdvanceAdds(1704, _ => { });
@@ -185,6 +186,17 @@ public sealed class ReliabilityTests
         // The callback was received at 1500, but its first read completed only after removal delivery.
         e.QueueAdd(Id(1), "Movie", Id(102), 1500, Setup); e.AdvanceAdds(1604, _ => { });
         Assert.True(j.State.Notices[Id(102)].Quiet); Assert.Equal("outbox", j.State.Notices[Id(102)].Stage);
+    }
+
+    [Fact] public void ReadyRepairWaitsForOriginalAcknowledgementRegardlessOfReadinessOrder()
+    {
+        using var temp = new TempDirectory(); using var j = new Journal(temp.Path); var m = new Model(); m.Add(1);
+        var e = new Engine(j, m, "key"); e.QueueAdd(Id(1), "Movie", Id(100), 1000, Setup); e.AdvanceAdds(1001, _ => { });
+        e.Remove(Id(1), Id(101), 1002, Setup); e.QueueAdd(Id(1), "Movie", Id(102), 1003, Setup);
+        e.Put(j.State.Notices[Id(102)] with { Stage = "outbox", ReadyAt = 1004 });
+        Assert.DoesNotContain(e.SubmittableNotices(), n => n.EventId == Id(102));
+        e.AdvanceAdds(1005, _ => { }); Assert.DoesNotContain(e.SubmittableNotices(), n => n.EventId == Id(102));
+        e.Acknowledge([Id(100)], 1006); Assert.Contains(e.SubmittableNotices(), n => n.EventId == Id(102));
     }
 
     [Fact] public void LostAddAcknowledgementAndDeliveredRemovalGetFreshQuietMembershipIdentity()
