@@ -21,6 +21,7 @@ public static class Identity
     public static string Hash(string text) => Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(text)));
     public static string UserHash(string serverKey, Guid user) => Hash("jellysee-user-v1:" + serverKey + ":" + user.ToString("N"))[..16];
     public static string PresentationKey(string serverKey, string profile) => "r:" + Hash("jellysee-recovery-v1:" + serverKey + ":" + profile)[..32];
+    public static string RegistrationRosterKey(string setupHash, string registration) => Hash("jellysee-registration-roster-v1:" + setupHash + ":" + registration)[..32];
     public static string EventId() => Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16));
     public static bool IsId(string? value) => value is { Length: 32 } && value.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f');
 }
@@ -148,16 +149,16 @@ public static class Wire
 public static class Responses
 {
     public const int MaxBytes = 16 * 1024;
-    public static async Task<byte[]> ReadBounded(Stream input, CancellationToken ct)
+    public static async Task<byte[]> ReadBounded(Stream input, CancellationToken ct, int limit = MaxBytes)
     {
         using var output = new MemoryStream();
         byte[] buffer = new byte[2048];
         while (true)
         {
-            int n = await input.ReadAsync(buffer.AsMemory(0, Math.Min(buffer.Length, MaxBytes + 1 - (int)output.Length)), ct);
+            int n = await input.ReadAsync(buffer.AsMemory(0, Math.Min(buffer.Length, limit + 1 - (int)output.Length)), ct);
             if (n == 0) return output.ToArray();
             output.Write(buffer, 0, n);
-            if (output.Length > MaxBytes) throw new InvalidDataException("Response cap");
+            if (output.Length > limit) throw new InvalidDataException("Response cap");
         }
     }
 
@@ -189,7 +190,7 @@ public static class Responses
     public static bool Retryable(HttpStatusCode status) => (int)status == 429 || (int)status >= 500;
 }
 
-public sealed record SendResult(bool Success, HashSet<string> Accepted, string ErrorCode, TimeSpan? RetryAfter = null, bool Retryable = true);
+public sealed record SendResult(bool Success, HashSet<string> Accepted, string ErrorCode, TimeSpan? RetryAfter = null, bool Retryable = true, HashSet<string>? CurrentRegistrations = null);
 
 public sealed class RelayClient : IDisposable
 {
@@ -217,12 +218,21 @@ public sealed class RelayClient : IDisposable
             if (response.Headers.RetryAfter?.Date is { } date) retry = date - DateTimeOffset.UtcNow;
             if (response.StatusCode != HttpStatusCode.OK)
                 return new(false, [], response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden ? "unauthorized" : "relayUnreachable", retry, Responses.Retryable(response.StatusCode));
-            if (response.Content.Headers.ContentLength > Responses.MaxBytes) throw new InvalidDataException("Response cap");
+            int responseLimit = route == "bindings" ? 32 * 1024 : Responses.MaxBytes;
+            if (response.Content.Headers.ContentLength > responseLimit) throw new InvalidDataException("Response cap");
             await using var stream = await response.Content.ReadAsStreamAsync(timeout.Token);
-            byte[] bytes = await Responses.ReadBounded(stream, timeout.Token);
+            byte[] bytes = await Responses.ReadBounded(stream, timeout.Token, responseLimit);
+            if (route == "bindings")
+            {
+                using var receipt = JsonDocument.Parse(bytes);
+                var current = receipt.RootElement.GetProperty("currentRegistrations").EnumerateArray().Select(e => e.GetString()!).ToHashSet(StringComparer.Ordinal);
+                var accepted = receipt.RootElement.GetProperty("accepted").EnumerateArray().Select(e => e.GetString()!).ToHashSet(StringComparer.Ordinal);
+                if (current.Count > 500 || current.Any(id => !Identity.IsId(id)) || accepted.Count > 64 || accepted.Any(id => !Identity.IsId(id))) throw new InvalidDataException("Invalid binding receipt");
+                return new(true, accepted, "none", CurrentRegistrations: current);
+            }
             return new(true, route == "events" ? Responses.Accepted(bytes, ids) : [], "none");
         }
-        catch (Exception ex) when (ex is HttpRequestException or IOException or JsonException or InvalidDataException or OperationCanceledException && !ct.IsCancellationRequested)
+        catch (Exception ex) when (ex is HttpRequestException or IOException or JsonException or InvalidDataException or KeyNotFoundException or InvalidOperationException or OperationCanceledException && !ct.IsCancellationRequested)
         { return new(false, [], "relayUnreachable"); }
     }
     public void Dispose() => client.Dispose();

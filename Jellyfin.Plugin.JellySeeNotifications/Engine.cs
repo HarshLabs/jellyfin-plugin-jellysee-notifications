@@ -303,7 +303,7 @@ public sealed class Engine
     }
     internal Recovery BeginRecovery(string setup, long now)
     {
-        if (State.Recoveries.TryGetValue(setup, out var ongoing) && !ongoing.Complete) return ongoing;
+        if (State.Recoveries.TryGetValue(setup, out var ongoing) && (!ongoing.Complete || ongoing.HasAddition && !ongoing.Emitted)) return ongoing;
         // Keep the preceding outage until its summary has drained. Reopening cannot create a second envelope.
         if (ongoing is not null && State.Notices.Values.Any(n => n.Op == "summary" && n.OutageId == ongoing.Id)) return ongoing;
         var recovery = new Recovery(Identity.EventId(), setup, now);
@@ -356,11 +356,11 @@ public sealed class Engine
         var valid = cursor.Proofs.Where(p => !Rules.Stale(p.Value, now)).ToArray();
         return (valid.Select(p => p.Key).Order(StringComparer.Ordinal).ToArray(), valid.Length == 0 ? now : Math.Min(now, valid.Min(p => p.Value)));
     }
-    internal void AdvanceRecovery(string setup, long now, bool complete)
+    internal void AdvanceRecovery(string setup, long now, bool complete, bool waitForApproval = false)
     {
         if (!State.Recoveries.TryGetValue(setup, out var recovery)) return;
         if (complete && !recovery.Complete) { recovery = recovery with { Complete = true }; journal.Commit(new Change { Kind = "recovery", Recovery = recovery }); }
-        if (!recovery.HasAddition || recovery.Emitted || !complete && now - recovery.CutoffAt < 600) return;
+        if (waitForApproval || !recovery.HasAddition || recovery.Emitted || !recovery.Complete && now - recovery.CutoffAt < 600) return;
         var profiles = State.Bindings.Values.Where(b => b.SetupHash == setup).Select(b => b.Profile).Distinct().Order(StringComparer.Ordinal).ToArray();
         if (profiles.Length == 0) return; // Retain until a bound profile exists; never invent a recipient.
         // Persist the complete transport envelope set and emission marker atomically in bounded chunks.

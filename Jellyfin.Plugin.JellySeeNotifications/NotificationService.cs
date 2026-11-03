@@ -28,6 +28,8 @@ public sealed class NotificationService : BackgroundService
     private readonly HeartbeatLimiter limiter;
     private readonly Channel<Signal> channel;
     private readonly Channel<BindWork> bindQueue = Channel.CreateBounded<BindWork>(64);
+    private readonly object bindGate = new();
+    private long bindSequence, bindAdmittedThrough;
     private readonly object coverageGate = new();
     private long coverageEpoch;
     private ImmutableArray<LibraryRoot> libraryRoots = [];
@@ -59,7 +61,7 @@ public sealed class NotificationService : BackgroundService
     private long WallNow => timeProvider.GetUtcNow().ToUnixTimeSeconds();
     private long Mono => timeProvider.GetTimestamp();
     private sealed record Signal(string Op, string Id, string? Type, string EventId, long At, string Setup, ImmutableHashSet<string> Coverage, long Sequence, string Origin, long ClockEpoch);
-    private sealed record BindWork(Binding Binding, TaskCompletionSource<bool> Completion);
+    private sealed record BindWork(Binding Binding, TaskCompletionSource<bool> Completion, long Sequence);
 
     public NotificationService(ILibraryManager library, IJellyfinCompat compat, IServerApplicationHost host, RelayClient relay, ILogger<NotificationService> logger, ITaskManager tasks)
         : this(library, compat, host, relay, logger,
@@ -162,9 +164,15 @@ public sealed class NotificationService : BackgroundService
         var config = configuration();
         if (!config.Enabled || config.Secret.Length == 0 || !Identity.IsId(registration) || !Binding.ValidProfile(profile)) return false;
         var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        if (!bindQueue.Writer.TryWrite(new(new(registration, profile, userHash, Identity.Hash(config.Secret), Now), completion))) return false;
+        lock (bindGate)
+        {
+            long sequence = bindSequence + 1;
+            if (!bindQueue.Writer.TryWrite(new(new(registration, profile, userHash, Identity.Hash(config.Secret), Now), completion, sequence))) return false;
+            Interlocked.Exchange(ref bindSequence, sequence);
+        }
         try { return await completion.Task.WaitAsync(TimeSpan.FromSeconds(15), ct); }
         catch (TimeoutException) { return false; }
+        finally { completion.TrySetResult(false); }
     }
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
@@ -291,6 +299,17 @@ public sealed class NotificationService : BackgroundService
         var bindingSentAt = new Queue<long>();
         var reportedBindings = new HashSet<string>(StringComparer.Ordinal);
         var refreshBindings = new HashSet<string>(StringComparer.Ordinal);
+        var resolvedBindings = new HashSet<string>(StringComparer.Ordinal);
+        var candidates = new Dictionary<string, Binding>(StringComparer.Ordinal);
+        var recoveryBarriers = new Dictionary<string, (long Through, string Setup, HashSet<string> Keys)>(StringComparer.Ordinal);
+        var bindWaiters = new Dictionary<string, List<TaskCompletionSource<bool>>>(StringComparer.Ordinal);
+        using var pendingBindings = new PendingBindingOwner(bindWaiters);
+        void AwaitReport(Binding b, TaskCompletionSource<bool> completion)
+        {
+            string key = ReportKey(b);
+            if (!bindWaiters.TryGetValue(key, out var waiters)) bindWaiters[key] = waiters = [];
+            waiters.Add(completion);
+        }
         var bindingReportOrder = new Dictionary<string, long>(StringComparer.Ordinal);
         long reportOrder = 0;
         static string ReportKey(Binding b) => b.Key + ":" + b.Profile + ":" + b.UserHash;
@@ -339,24 +358,26 @@ public sealed class NotificationService : BackgroundService
             if (lost != 0) { Uncover("channelDropped"); journal.Commit(new Change { Kind = "health", Health = journal.State.Health with { Dropped = journal.State.Health.Dropped + lost } }); reconcileAt = null; scan = null; }
             for (int admitted = 0; admitted < 8 && timeProvider.GetElapsedTime(slice) < TimeSpan.FromMilliseconds(250) && engine.BudgetAvailable() && bindQueue.Reader.TryRead(out var bind); admitted++)
             {
+                bindAdmittedThrough = bind.Sequence;
+                if (bind.Completion.Task.IsCompleted) continue;
+                foreach (var barrier in recoveryBarriers.Values)
+                    if (bind.Sequence <= barrier.Through && bind.Binding.SetupHash == barrier.Setup) barrier.Keys.Add(ReportKey(bind.Binding));
                 try
                 {
-                    var retained = journal.State.Bindings.Values.Where(b => b.SetupHash == bind.Binding.SetupHash).ToArray();
-                    var prior = journal.State.Bindings.GetValueOrDefault(bind.Binding.Key);
-                    if (prior is not null && prior.UserHash != bind.Binding.UserHash) { bind.Completion.TrySetResult(false); continue; }
-                    // Repeat approvals need a fresh relay report, not another durable write or a
-                    // revocation of an already submitted tuple's notification eligibility.
-                    if (prior is not null && prior.Profile == bind.Binding.Profile)
-                    { refreshBindings.Add(ReportKey(prior)); bind.Completion.TrySetResult(true); continue; }
-                    var owned = retained.Where(b => b.UserHash == bind.Binding.UserHash).OrderBy(b => b.Sequence).ThenBy(b => b.BoundAt).ThenBy(b => b.Key, StringComparer.Ordinal).ToArray();
-                    if (prior is null && retained.Length >= 500 && owned.Length == 0) { bind.Completion.TrySetResult(false); continue; }
-                    int evict = Math.Max(0, owned.Length + (prior is null ? 1 : 0) - 64);
-                    if (prior is null && retained.Length >= 500) evict = Math.Max(1, evict);
-                    List<Change> changes = owned.Where(b => b.Key != bind.Binding.Key).Take(evict).Select(b => new Change { Kind = "unbinding", Key = b.Key }).ToList();
-                    changes.Add(new() { Kind = "binding", Binding = bind.Binding with { Sequence = journal.State.Seq + 1 } });
-                    foreach (var chunk in changes.Chunk(200)) journal.Commit(chunk);
+                    var prior = candidates.GetValueOrDefault(bind.Binding.Key) ?? journal.State.Bindings.GetValueOrDefault(bind.Binding.Key);
+                    if (prior is not null && (prior.UserHash != bind.Binding.UserHash || candidates.ContainsKey(prior.Key) && prior.Profile != bind.Binding.Profile))
+                    { bind.Completion.TrySetResult(false); continue; }
+                    // Candidates cannot replace a durable approval until the relay accepts them.
+                    // Repeat approvals still require a fresh, rate-limited binding report.
+                    if (prior is not null && prior.Profile == bind.Binding.Profile && !candidates.ContainsKey(prior.Key))
+                    {
+                        resolvedBindings.Remove(ReportKey(prior)); refreshBindings.Add(ReportKey(prior));
+                        AwaitReport(prior, bind.Completion); continue;
+                    }
+                    candidates[bind.Binding.Key] = bind.Binding with { Sequence = journal.State.Seq + 1 };
+                    resolvedBindings.Remove(ReportKey(bind.Binding));
                     reportedBindings.Remove(ReportKey(bind.Binding));
-                    bind.Completion.TrySetResult(true);
+                    AwaitReport(bind.Binding, bind.Completion);
                 }
                 catch { bind.Completion.TrySetResult(false); throw; }
             }
@@ -489,18 +510,33 @@ public sealed class NotificationService : BackgroundService
                 if (censusComplete) uncoveredStamp = null; else uncoveredStamp ??= Mono;
                 var pendingSetups = pendingSignals.Where(s => s.Op == "add").Select(s => s.Setup).ToHashSet(StringComparer.Ordinal);
                 var recoveringSetups = journal.State.Notices.Values.Where(n => n.Stage == "pendingAdd" && (n.Origin == "recovery" || n.Folded || n.EnqueuedSeq <= journal.State.Health.QuietThroughSeq)).Select(n => n.SetupHash).ToHashSet(StringComparer.Ordinal);
-                foreach (string hash in credentials.Keys)
-                    engine.AdvanceRecovery(hash, now, censusComplete && !pendingSetups.Contains(hash) && !recoveringSetups.Contains(hash));
+                // Freeze only candidates already present when this outage becomes eligible.
+                // Later churn cannot extend the finite approval barrier.
+                var liveRecoveries = journal.State.Recoveries.Values.Where(r => !r.Emitted).Select(r => r.Id).ToHashSet(StringComparer.Ordinal);
+                foreach (string id in recoveryBarriers.Keys.Where(id => !liveRecoveries.Contains(id)).ToArray()) recoveryBarriers.Remove(id);
+                foreach (var recovery in journal.State.Recoveries.Values.Where(r => !r.Emitted && r.HasAddition))
+                    if ((censusComplete && !pendingSetups.Contains(recovery.SetupHash) && !recoveringSetups.Contains(recovery.SetupHash)
+                        || recovery.Complete || now - recovery.CutoffAt >= 600) && !recoveryBarriers.ContainsKey(recovery.Id))
+                        recoveryBarriers[recovery.Id] = (Interlocked.Read(ref bindSequence), recovery.SetupHash,
+                            candidates.Values.Where(b => b.SetupHash == recovery.SetupHash).Select(ReportKey).ToHashSet(StringComparer.Ordinal));
                 foreach (var hash in credentials.Keys) if (!schedules.ContainsKey(hash)) schedules[hash] = new();
                 while (sentAt.TryPeek(out long prior) && timeProvider.GetElapsedTime(prior) >= TimeSpan.FromMinutes(1)) sentAt.Dequeue();
                 while (bindingSentAt.TryPeek(out long bindingAt) && timeProvider.GetElapsedTime(bindingAt) >= TimeSpan.FromMinutes(1)) bindingSentAt.Dequeue();
+                foreach (string key in bindWaiters.Keys.ToArray())
+                {
+                    bindWaiters[key].RemoveAll(w => w.Task.IsCompleted);
+                    if (bindWaiters[key].Count == 0) bindWaiters.Remove(key);
+                }
+                foreach (var b in candidates.Values.ToArray())
+                    if (!bindWaiters.ContainsKey(ReportKey(b))) candidates.Remove(b.Key);
                 if (Math.Max(Math.Max(reportedBindings.Count, refreshBindings.Count), bindingReportOrder.Count) > journal.State.Bindings.Count + 64)
                 {
                     var retainedReports = journal.State.Bindings.Values.Select(ReportKey).ToHashSet(StringComparer.Ordinal);
-                    reportedBindings.IntersectWith(retainedReports); refreshBindings.IntersectWith(retainedReports);
+                    reportedBindings.IntersectWith(retainedReports); refreshBindings.IntersectWith(retainedReports); resolvedBindings.IntersectWith(retainedReports);
                     foreach (string key in bindingReportOrder.Keys.Where(k => !retainedReports.Contains(k)).ToArray()) bindingReportOrder.Remove(key);
                 }
-                var bindingGroup = journal.State.Bindings.Values.Where(b => credentials.ContainsKey(b.SetupHash) && (!reportedBindings.Contains(ReportKey(b)) || refreshBindings.Contains(ReportKey(b))))
+                var bindingGroup = journal.State.Bindings.Values.Where(b => !candidates.ContainsKey(b.Key)).Concat(candidates.Values)
+                    .Where(b => credentials.ContainsKey(b.SetupHash) && (!reportedBindings.Contains(ReportKey(b)) && !resolvedBindings.Contains(ReportKey(b)) || refreshBindings.Contains(ReportKey(b))))
                     .OrderBy(b => bindingReportOrder.GetValueOrDefault(ReportKey(b))).ThenBy(b => b.Sequence).ThenBy(b => b.Key, StringComparer.Ordinal)
                     .GroupBy(b => b.SetupHash).Where(g => schedules[g.Key].Due(timeProvider)).OrderBy(g => schedules[g.Key].LastAttempt).FirstOrDefault();
                 bool eventsWaiting = journal.State.Notices.Values.Any(n => n.Stage == "outbox");
@@ -510,14 +546,59 @@ public sealed class NotificationService : BackgroundService
                     byte[] body = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new { v = 3, server = host.SystemId, bindings = report.Select(b => new { registration = b.Registration, profile = b.Profile, userHash = b.UserHash }) });
                     sentAt.Enqueue(Mono); bindingSentAt.Enqueue(Mono); schedules[bindingGroup.Key].LastAttempt = Mono;
                     foreach (var b in report) bindingReportOrder[ReportKey(b)] = ++reportOrder;
+                    long reportStarted = Mono;
                     var result = await relay.Post(config.RelayOrigin, Identity.ServerKey(host.SystemId), credentials[bindingGroup.Key], "bindings", body, [], ct);
-                    if (result.Success) foreach (var b in report) { reportedBindings.Add(ReportKey(b)); refreshBindings.Remove(ReportKey(b)); }
-                    else schedules[bindingGroup.Key].Delay(timeProvider, ProbeDelay(result, ++schedules[bindingGroup.Key].Attempts));
+                    // Network waiting consumes the HTTP deadline, not the loop's bounded processing budget.
+                    slice += Mono - reportStarted;
+                    if (result.Success && result.CurrentRegistrations is { } roster)
+                    {
+                        // Absence from the authenticated roster resolves a stale summary prerequisite
+                        // without granting approval or deleting its retained tuple before capacity pressure.
+                        foreach (var retained in journal.State.Bindings.Values.Where(b => b.SetupHash == bindingGroup.Key))
+                            if (!roster.Contains(Identity.RegistrationRosterKey(retained.SetupHash, retained.Registration))) resolvedBindings.Add(ReportKey(retained));
+                    }
+                    foreach (var b in report)
+                    {
+                        if (result.Success)
+                        {
+                            refreshBindings.Remove(ReportKey(b));
+                            if (!result.Accepted.Contains(b.Registration)) resolvedBindings.Add(ReportKey(b));
+                        }
+                        bool candidate = candidates.Remove(b.Key);
+                        var currentConfig = configuration();
+                        bool currentSetup = currentConfig.Enabled && Identity.Hash(currentConfig.Secret) == b.SetupHash;
+                        bool accepted = result.Success && result.Accepted.Contains(b.Registration) && currentConfig.Enabled
+                            && (candidate ? currentSetup : Credentials.Available(currentConfig, WallNow).ContainsKey(b.SetupHash));
+                        if (candidate && accepted)
+                        {
+                            var retained = journal.State.Bindings.Values.Where(old => old.SetupHash == b.SetupHash).ToArray();
+                            List<Change> changes = [];
+                            if (!journal.State.Bindings.ContainsKey(b.Key) && retained.Length >= 500)
+                            {
+                                var oldest = retained.OrderBy(old => result.CurrentRegistrations!.Contains(Identity.RegistrationRosterKey(old.SetupHash, old.Registration)) ? 1 : 0)
+                                    .ThenBy(old => old.Sequence).ThenBy(old => old.BoundAt).ThenBy(old => old.Key, StringComparer.Ordinal).First();
+                                changes.Add(new() { Kind = "unbinding", Key = oldest.Key });
+                            }
+                            changes.Add(new() { Kind = "binding", Binding = b with { Sequence = journal.State.Seq + 1 } });
+                            journal.Commit(changes.ToArray());
+                        }
+                        if (accepted) { reportedBindings.Add(ReportKey(b)); resolvedBindings.Remove(ReportKey(b)); refreshBindings.Remove(ReportKey(b)); }
+                        if (bindWaiters.Remove(ReportKey(b), out var waiters))
+                            foreach (var waiter in waiters) waiter.TrySetResult(accepted && currentSetup);
+                    }
+                    if (!result.Success) schedules[bindingGroup.Key].Delay(timeProvider, ProbeDelay(result, ++schedules[bindingGroup.Key].Attempts));
+                }
+                foreach (string hash in credentials.Keys)
+                {
+                    var recovery = journal.State.Recoveries.GetValueOrDefault(hash);
+                    bool waiting = recovery is not null && recoveryBarriers.TryGetValue(recovery.Id, out var barrier)
+                        && (bindAdmittedThrough < barrier.Through || candidates.Values.Any(b => barrier.Keys.Contains(ReportKey(b))));
+                    engine.AdvanceRecovery(hash, now, censusComplete && !pendingSetups.Contains(hash) && !recoveringSetups.Contains(hash), waiting);
                 }
                 // A summary waits for its profile's approvals present at creation. Later registration
                 // churn cannot move that finite barrier; legacy events do not depend on bindings.
                 var group = journal.State.Notices.Values.Where(n => n.Stage == "outbox" && (n.Op != "summary" || journal.State.Recoveries.Values.Any(r => r.Id == n.OutageId && r.Emitted) &&
-                        !journal.State.Bindings.Values.Any(b => b.SetupHash == n.SetupHash && b.Profile == n.Profile && b.Sequence <= n.EnqueuedSeq && !reportedBindings.Contains(ReportKey(b)))) &&
+                        !journal.State.Bindings.Values.Any(b => b.SetupHash == n.SetupHash && b.Profile == n.Profile && b.Sequence <= n.EnqueuedSeq && !reportedBindings.Contains(ReportKey(b)) && !resolvedBindings.Contains(ReportKey(b)))) &&
                         !Rules.Expired(n, now) && credentials.ContainsKey(n.SetupHash))
                     .GroupBy(n => n.SetupHash).Where(g => schedules[g.Key].Due(timeProvider)).OrderBy(g => schedules[g.Key].LastAttempt).FirstOrDefault();
                 var pending = group?.OrderBy(n => n.EnqueuedSeq <= journal.State.Health.QuietThroughSeq ? 0 : 1).ThenBy(n => n.QueuedAt).ToArray() ?? [];
@@ -611,6 +692,15 @@ public sealed class NotificationService : BackgroundService
         }
         return changed;
     }
+    private sealed class PendingBindingOwner(Dictionary<string, List<TaskCompletionSource<bool>>> waiters) : IDisposable
+    {
+        public void Dispose()
+        {
+            foreach (var group in waiters.Values)
+                foreach (var waiter in group) waiter.TrySetResult(false);
+        }
+    }
+
     private sealed class SendSchedule
     {
         private long? at;

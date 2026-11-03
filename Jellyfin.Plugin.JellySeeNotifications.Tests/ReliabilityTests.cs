@@ -485,7 +485,7 @@ public sealed class ReliabilityTests
         int attempts = 0; var fake = new CompatFake { Libraries = [FixtureLibrary(0)] }; fake.Add(1);
         using var h = new ServiceHarness(temp.Path, clock, new PluginConfiguration { Enabled = true, Secret = "fixture" }, compat: fake, send: async (request, ct) =>
         {
-            if (request.RequestUri!.Segments[^1] != "events") return new(HttpStatusCode.OK) { Content = new StringContent("{}") };
+            if (request.RequestUri!.Segments[^1] != "events") return ApprovalResponse(request);
             if (Interlocked.Increment(ref attempts) == 1) return new(HttpStatusCode.Unauthorized);
             using var json = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(ct));
             return new(HttpStatusCode.OK) { Content = new StringContent(JsonSerializer.Serialize(new { accepted = json.RootElement.GetProperty("events").EnumerateArray().Select(e => e.GetProperty("e").GetString()).ToArray() })) };
@@ -507,7 +507,7 @@ public sealed class ReliabilityTests
         var blocked = new TaskCompletionSource<HttpResponseMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
         var fake = new CompatFake { Libraries = [FixtureLibrary(0)] }; fake.Add(1);
         using var h = new ServiceHarness(temp.Path, clock, new PluginConfiguration { Enabled = true, Secret = "fixture" }, compat: fake,
-            send: (request, ct) => request.RequestUri!.Segments[^1] == "events" ? blocked.Task.WaitAsync(ct) : Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("{}") }));
+            send: (request, ct) => request.RequestUri!.Segments[^1] == "events" ? blocked.Task.WaitAsync(ct) : Task.FromResult(ApprovalResponse(request)));
         await h.Service.StartAsync(default);
         try
         {
@@ -601,7 +601,7 @@ public sealed class ReliabilityTests
             factory: (path, root, token, owner) => ++opens <= 2 ? throw new IOException("private-state-path", unchecked((int)0x80070020)) : new Journal(path, root, token, TimeSpan.FromSeconds(3), owner, versioned: true),
             retry: (_, ct) => Task.Delay(1, ct), send: async (request, ct) =>
             {
-                if (request.RequestUri!.Segments[^1] != "events") return new(HttpStatusCode.OK) { Content = new StringContent("{}") };
+                if (request.RequestUri!.Segments[^1] != "events") return ApprovalResponse(request);
                 if (Volatile.Read(ref minute) < 15) { Interlocked.Increment(ref failedPosts); return new(HttpStatusCode.ServiceUnavailable) { Headers = { RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(TimeSpan.FromSeconds(60)) } }; }
                 using var json = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(ct));
                 return new(HttpStatusCode.OK) { Content = new StringContent(JsonSerializer.Serialize(new { accepted = json.RootElement.GetProperty("events").EnumerateArray().Select(e => e.GetProperty("e").GetString()).ToArray() })) };
@@ -667,7 +667,7 @@ public sealed class ReliabilityTests
         using var temp = new TempDirectory(); var clock = new Clock(); Seed(temp.Path, clock.GetUtcNow().ToUnixTimeSeconds(), binding: true, outbox: true);
         var fake = new CompatFake { Libraries = [FixtureLibrary(0)] }; fake.Add(1); int events = 0;
         using var h = new ServiceHarness(temp.Path, clock, new PluginConfiguration { Enabled = true, Secret = "fixture" }, compat: fake,
-            send: (request, _) => Task.FromResult(request.RequestUri!.Segments[^1] == "events" ? (Interlocked.Increment(ref events) > 0 ? new HttpResponseMessage(HttpStatusCode.Unauthorized) : throw new InvalidOperationException()) : new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("{}") }));
+            send: (request, _) => Task.FromResult(request.RequestUri!.Segments[^1] == "events" ? (Interlocked.Increment(ref events) > 0 ? new HttpResponseMessage(HttpStatusCode.Unauthorized) : throw new InvalidOperationException()) : ApprovalResponse(request)));
         await h.Service.StartAsync(default);
         try
         {
@@ -738,7 +738,7 @@ public sealed class ReliabilityTests
         var fake = new CompatFake { Libraries = [FixtureLibrary(0)] }; fake.Add(1);
         var blocked = new TaskCompletionSource<HttpResponseMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
         using var h = new ServiceHarness(temp.Path, clock, new PluginConfiguration { Enabled = true, Secret = "fixture" }, compat: fake,
-            send: (request, ct) => request.RequestUri!.Segments[^1] == "events" ? blocked.Task.WaitAsync(ct) : Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("{}") }));
+            send: (request, ct) => request.RequestUri!.Segments[^1] == "events" ? blocked.Task.WaitAsync(ct) : Task.FromResult(ApprovalResponse(request)));
         await h.Service.StartAsync(default);
         try
         {
@@ -785,7 +785,7 @@ public sealed class ReliabilityTests
         using var temp = new TempDirectory(); var clock = new Clock(); Seed(temp.Path, clock.GetUtcNow().ToUnixTimeSeconds(), binding: true, outbox: true);
         var fake = new CompatFake { Libraries = [FixtureLibrary(0)] }; fake.Add(1);
         var config = new PluginConfiguration { Enabled = true, Secret = "fixture" };
-        using var h = new ServiceHarness(temp.Path, clock, config, compat: fake, send: (request, _) => Task.FromResult(new HttpResponseMessage(request.RequestUri!.Segments[^1] == "events" ? HttpStatusCode.Unauthorized : HttpStatusCode.OK) { Content = new StringContent("{}") }));
+        using var h = new ServiceHarness(temp.Path, clock, config, compat: fake, send: (request, _) => Task.FromResult(request.RequestUri!.Segments[^1] == "events" ? new HttpResponseMessage(HttpStatusCode.Unauthorized) : ApprovalResponse(request)));
         await h.Service.StartAsync(default);
         try
         {
@@ -883,7 +883,7 @@ public sealed class ReliabilityTests
     }
 
     [Theory] [InlineData(1)] [InlineData(500)]
-    public async Task BindingChurnCannotEvictOrReplaceAnotherUsersApproval(int victims)
+    public async Task BindingRetentionHasNoPerUserLimitAndRejectsIdentityReplacement(int victims)
     {
         using var temp = new TempDirectory(); var clock = new Clock(); string setup = Identity.Hash("fixture"), attacker = "bbbbbbbbbbbbbbbb";
         using (var j = new Journal(temp.Path))
@@ -898,24 +898,25 @@ public sealed class ReliabilityTests
             for (int i = 0; i < (victims == 500 ? 1 : 70); i++)
             {
                 var bind = h.Service.Bind(Id(100000 + i), "attacker-" + i, attacker, default); await Pump(clock, () => bind.IsCompleted);
-                if (victims == 500) Assert.False(await bind);
+                Assert.True(await bind);
             }
             await Pump(clock, () => h.Service.Snapshot.ProgressStamp == clock.GetTimestamp());
-            Assert.Equal(victims, h.Service.Snapshot.Bindings.Count(b => b.UserHash == UserHash)); Assert.InRange(h.Service.Snapshot.Bindings.Count(b => b.UserHash == attacker), 0, 64);
-            var replace = h.Service.Bind(Id(1000), "attacker", attacker, default); await Pump(clock, () => replace.IsCompleted); Assert.False(await replace);
+            Assert.Equal(victims == 500 ? 499 : victims, h.Service.Snapshot.Bindings.Count(b => b.UserHash == UserHash)); Assert.Equal(victims == 500 ? 1 : 70, h.Service.Snapshot.Bindings.Count(b => b.UserHash == attacker));
+            var replace = h.Service.Bind(Id(1000 + victims - 1), "attacker", attacker, default); await Pump(clock, () => replace.IsCompleted); Assert.False(await replace);
         }
         finally { await h.Service.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(4)); }
     }
 
-    [Theory] [InlineData(false, false)] [InlineData(true, false)] [InlineData(false, true)] [InlineData(true, true)]
-    public async Task ContinuousRebindingCannotStrandAnotherUsersBindingOrEvents(bool summary, bool newRegistrations)
+    [Theory] [InlineData(false, false, false)] [InlineData(true, false, false)] [InlineData(false, true, false)] [InlineData(true, true, false)]
+    [InlineData(false, true, true)] [InlineData(true, true, true)]
+    public async Task ContinuousRebindingCannotStrandAnotherUsersBindingOrEvents(bool summary, bool newRegistrations, bool atCapacity)
     {
         using var temp = new TempDirectory(); var clock = new Clock(); long now = clock.GetUtcNow().ToUnixTimeSeconds();
         string setup = Identity.Hash("fixture"), attacker = "bbbbbbbbbbbbbbbb";
         Seed(temp.Path, now);
         using (var j = new Journal(temp.Path, Path.GetDirectoryName(temp.Path)!, default, TimeSpan.FromSeconds(3), versioned: true))
         {
-            for (int i = 0; i < 64; i++) j.Commit(new Change { Kind = "binding", Binding = new(Id(1000 + i), "victim", attacker, setup, now, j.State.Seq + 1) });
+            for (int i = 0; i < (atCapacity ? 499 : 64); i++) j.Commit(new Change { Kind = "binding", Binding = new(Id(1000 + i), "victim", attacker, setup, now, j.State.Seq + 1) });
             j.Commit(new Change { Kind = "binding", Binding = new(Id(999), "victim", UserHash, setup, now, j.State.Seq + 1) });
             var e = new Engine(j, new Model(), "key");
             if (summary)
@@ -939,8 +940,7 @@ public sealed class ReliabilityTests
                 int offset = newRegistrations ? 64 * ++generation : 0;
                 for (int i = 0; i < 64; i++) refreshes.Add(running!.Service.Bind(Id(1000 + offset + i), "victim", attacker, default));
             }
-            return new(HttpStatusCode.OK) { Content = new StringContent(json.RootElement.TryGetProperty("events", out var events)
-                ? JsonSerializer.Serialize(new { accepted = events.EnumerateArray().Select(e => e.GetProperty("e").GetString()).ToArray() }) : "{}") };
+            return ApprovalResponse(request);
         });
         running = h; await h.Service.StartAsync(default);
         try { await Pump(clock, () => victimReported && SentEvents(h).Any()); Assert.Equal(summary ? "summary" : "add", Assert.Single(SentEvents(h)).GetProperty("op").GetString()); }
@@ -954,7 +954,7 @@ public sealed class ReliabilityTests
         bool repaired = false; var submittedWith = new ConcurrentQueue<string>();
         using var h = new ServiceHarness(temp.Path, clock, config, compat: fake, send: async (request, ct) =>
         {
-            if (request.RequestUri!.Segments[^1] != "events") return new(HttpStatusCode.OK) { Content = new StringContent("{}") };
+            if (request.RequestUri!.Segments[^1] != "events") return ApprovalResponse(request);
             if (!repaired) return new(HttpStatusCode.Unauthorized);
             using var json = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(ct));
             if (json.RootElement.GetProperty("events").EnumerateArray().Any(e => e.GetProperty("op").GetString() == "summary")) submittedWith.Enqueue(request.Headers.Authorization!.Parameter!);
@@ -995,6 +995,254 @@ public sealed class ReliabilityTests
             Assert.InRange(Assert.Single(SentEvents(h), e => e.GetProperty("op").GetString() == "add").GetProperty("firstSeenAt").GetInt64(), corrected, corrected + 240);
         }
         finally { release.Set(); await h.Service.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(4)); }
+    }
+
+    [Fact] public async Task BindWaitsForRelayAcceptanceAndFailureIsRetryable()
+    {
+        using var temp = new TempDirectory(); var clock = new Clock();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        bool fail = true, entered = false;
+        using var h = new ServiceHarness(temp.Path, clock, new PluginConfiguration { Enabled = true, Secret = "fixture" },
+            send: async (request, ct) => {
+                if (request.RequestUri!.Segments[^1] != "bindings") return ApprovalResponse(request);
+                entered = true; await release.Task.WaitAsync(ct);
+                return fail ? new(HttpStatusCode.ServiceUnavailable) : ApprovalResponse(request);
+            });
+        await h.Service.StartAsync(default);
+        try
+        {
+            var controller = Controller(h.Service, Guid.ParseExact(Id(1), "N"));
+            var bind = controller.Bind(new(Id(100), "profile"), default);
+            await Pump(clock, () => entered);
+            Assert.False(bind.IsCompleted);
+            release.SetResult(); await Pump(clock, () => bind.IsCompleted);
+            Assert.Equal(503, Assert.IsType<StatusCodeResult>(await bind).StatusCode);
+            fail = false; clock.Advance(TimeSpan.FromMinutes(2));
+            var retry = controller.Bind(new(Id(100), "profile"), default);
+            await Pump(clock, () => retry.IsCompleted); Assert.IsType<OkResult>(await retry);
+        }
+        finally { release.TrySetResult(); await h.Service.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(4)); }
+    }
+
+    [Fact] public async Task SixtyFiveProfilesSurviveBindingAndRestartAndAllHaveEntitledSummaries()
+    {
+        using var temp = new TempDirectory(); var clock = new Clock();
+        string setup = Identity.Hash("fixture");
+        using (var h = new ServiceHarness(temp.Path, clock, new PluginConfiguration { Enabled = true, Secret = "fixture" }))
+        {
+            await h.Service.StartAsync(default);
+            try
+            {
+                for (int i = 0; i < 65; i++)
+                {
+                    var bind = h.Service.Bind(Id(1000 + i), "profile-" + i, UserHash, default);
+                    await Pump(clock, () => bind.IsCompleted); Assert.True(await bind);
+                    clock.Advance(TimeSpan.FromSeconds(61)); // respect the shared relay budget
+                }
+                await Pump(clock, () => h.Service.Snapshot.Bindings.Length == 65);
+            }
+            finally { await h.Service.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(4)); }
+        }
+        using var j = new Journal(temp.Path, Path.GetDirectoryName(temp.Path)!, default, TimeSpan.FromSeconds(3), versioned: true);
+        Assert.Equal(65, j.State.Bindings.Count);
+        var model = new Model(); model.Add(1);
+        long now = clock.GetUtcNow().ToUnixTimeSeconds(); var engine = new Engine(j, model, Identity.ServerKey("fixture"));
+        engine.BeginRecovery(setup, now); engine.QueueAdd(Id(1), "Movie", Id(100), now, setup, "recovery");
+        engine.AdvanceAdds(now + 1, _ => { });
+        foreach (var n in j.State.Notices.Values.ToArray()) engine.Freshen(n, now + 2);
+        engine.AdvanceRecovery(setup, now + 2, true);
+        var summaries = j.State.Notices.Values.Where(n => n.Op == "summary").ToArray();
+        Assert.Equal(65, summaries.Select(n => n.Profile).Distinct().Count());
+        Assert.All(summaries, n => Assert.Equal(new[] { UserHash }, engine.Freshen(n, now + 2)!.Audience));
+    }
+
+    [Theory] [InlineData(false)] [InlineData(true)]
+    public async Task AtCapacityEvictsStaleBeforeOldestCurrent(bool stale)
+    {
+        using var temp = new TempDirectory(); var clock = new Clock(); string setup = Identity.Hash("fixture");
+        using (var j = new Journal(temp.Path))
+        {
+            for (int i = 0; i < 500; i++) j.State.Apply(new Change { Kind = "binding", Binding = new(Id(1000 + i), "p" + i, UserHash, setup, i, i + 1) });
+            j.Compact();
+        }
+        var roster = Enumerable.Range(0, 500).Where(i => !stale || i != 200).Select(i => Id(1000 + i)).ToArray();
+        using var h = new ServiceHarness(temp.Path, clock, new PluginConfiguration { Enabled = true, Secret = "fixture" },
+            send: (request, _) => {
+                using var json = JsonDocument.Parse(request.Content!.ReadAsStringAsync().GetAwaiter().GetResult());
+                if (request.RequestUri!.Segments[^1] != "bindings") return Task.FromResult(ApprovalResponse(request));
+                var accepted = json.RootElement.GetProperty("bindings").EnumerateArray().Select(b => b.GetProperty("registration").GetString()).ToArray();
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(JsonSerializer.Serialize(new { currentRegistrations = RosterKeys(request, roster), accepted })) });
+            });
+        await h.Service.StartAsync(default);
+        try
+        {
+            await Pump(clock, () => h.Service.Snapshot.Bindings.Length == 500);
+            var bind = h.Service.Bind(Id(9999), "new", UserHash, default); await Pump(clock, () => bind.IsCompleted); Assert.True(await bind);
+            await Pump(clock, () => h.Service.Snapshot.Bindings.Any(b => b.Registration == Id(9999)));
+            Assert.Equal(500, h.Service.Snapshot.Bindings.Length);
+            Assert.DoesNotContain(h.Service.Snapshot.Bindings, b => b.Registration == Id(stale ? 1200 : 1000));
+            if (stale) Assert.Contains(h.Service.Snapshot.Bindings, b => b.Registration == Id(1000));
+        }
+        finally { await h.Service.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(4)); }
+    }
+
+    [Fact] public async Task RejectedAdmissionAtCapacityPreservesEveryDurableApproval()
+    {
+        using var temp = new TempDirectory(); var clock = new Clock(); string setup = Identity.Hash("fixture");
+        using (var j = new Journal(temp.Path))
+        {
+            for (int i = 0; i < 500; i++) j.State.Apply(new Change { Kind = "binding", Binding = new(Id(1000 + i), "p" + i, UserHash, setup, i, i + 1) });
+            j.Compact();
+        }
+        var roster = Enumerable.Range(1000, 500).Select(Id).ToArray();
+        using var h = new ServiceHarness(temp.Path, clock, new PluginConfiguration { Enabled = true, Secret = "fixture" },
+            send: (request, _) => {
+                if (request.RequestUri!.Segments[^1] != "bindings") return Task.FromResult(ApprovalResponse(request));
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(JsonSerializer.Serialize(new {
+                    currentRegistrations = RosterKeys(request, roster), accepted = Array.Empty<string>() })) });
+            });
+        await h.Service.StartAsync(default);
+        try
+        {
+            await Pump(clock, () => h.Service.Snapshot.Bindings.Length == 500);
+            var bind = h.Service.Bind(Id(9999), "candidate", UserHash, default);
+            await Pump(clock, () => bind.IsCompleted); Assert.False(await bind);
+            Assert.Equal(roster.Order(), h.Service.Snapshot.Bindings.Select(b => b.Registration).Order());
+        }
+        finally { await h.Service.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(4)); }
+    }
+
+    [Theory] [InlineData(false, false)] [InlineData(true, false)] [InlineData(false, true)]
+    public async Task RejectedRegistrationCannotBlockCurrentProfilesSummaryAfterRestart(bool rotated, bool currentMismatch)
+    {
+        using var temp = new TempDirectory(); var clock = new Clock(); long now = clock.GetUtcNow().ToUnixTimeSeconds();
+        string setup = Identity.Hash("fixture"); Seed(temp.Path, now, binding: true);
+        using (var j = new Journal(temp.Path, Path.GetDirectoryName(temp.Path)!, default, TimeSpan.FromSeconds(3), versioned: true))
+        {
+            j.Commit(new Change { Kind = "binding", Binding = new(Id(1000), "profile", UserHash, setup, now, j.State.Seq + 1) });
+            var e = new Engine(j, new Model(), Identity.ServerKey("fixture")); var recovery = e.BeginRecovery(setup, now - 301);
+            j.Commit(new Change { Kind = "recovery", Recovery = recovery with { Complete = true, Emitted = true, HasAddition = true } },
+                new() { Kind = "recoveryItem", RecoveryItem = new(Id(1), recovery.Id, setup) });
+            e.Put(new Notice { EventId = Id(100), Op = "summary", Stage = "outbox", SetupHash = setup, QueuedAt = now - 300, FirstSeenAt = now - 300, At = now,
+                OutageStart = now - 301, OutageId = recovery.Id, Profile = "profile", PresentationKey = Identity.PresentationKey(Identity.ServerKey("fixture"), "profile") });
+        }
+        var fake = new CompatFake { Libraries = [FixtureLibrary(now)] }; fake.Add(1);
+        using var h = new ServiceHarness(temp.Path, clock, new PluginConfiguration { Enabled = true, Secret = rotated ? "rotated" : "fixture",
+                RetiredSecrets = rotated ? [new() { Secret = "fixture", RetiredAt = now }] : [] }, compat: fake,
+            send: (request, _) => {
+                if (request.RequestUri!.Segments[^1] != "bindings") return Task.FromResult(ApprovalResponse(request));
+                using var json = JsonDocument.Parse(request.Content!.ReadAsStringAsync().GetAwaiter().GetResult());
+                var accepted = json.RootElement.GetProperty("bindings").EnumerateArray().Select(b => b.GetProperty("registration").GetString()).Where(id => id == Id(999)).ToArray();
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(JsonSerializer.Serialize(new { currentRegistrations = RosterKeys(request, currentMismatch ? [Id(999), Id(1000)] : [Id(999)]), accepted })) });
+            });
+        await h.Service.StartAsync(default);
+        try { await Pump(clock, () => SentEvents(h).Any()); Assert.Equal("summary", Assert.Single(SentEvents(h)).GetProperty("op").GetString()); }
+        finally { await h.Service.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(4)); }
+    }
+
+    [Fact] public void RecoveryAdditionSurvivesACompleteCensusWhileApprovalIsPending()
+    {
+        using var temp = new TempDirectory(); using var j = new Journal(temp.Path);
+        var model = new Model(); model.Add(1); Bound(j);
+        var engine = new Engine(j, model, "key"); var recovery = engine.BeginRecovery(Setup, 1000);
+        j.Commit(new Change { Kind = "recovery", Recovery = recovery with { HasAddition = true } },
+            new() { Kind = "recoveryItem", RecoveryItem = new(Id(1), recovery.Id, Setup) });
+        engine.AdvanceRecovery(Setup, 1001, true, waitForApproval: true);
+        Assert.True(j.State.Recoveries[Setup].Complete); Assert.False(j.State.Recoveries[Setup].Emitted);
+        Assert.Equal(recovery.Id, engine.BeginRecovery(Setup, 1002).Id);
+        Assert.Contains(j.State.RecoveryItems.Values, item => item.Id == Id(1) && item.OutageId == recovery.Id);
+        engine.AdvanceRecovery(Setup, 1003, false);
+        Assert.Equal(new[] { UserHash }, engine.Freshen(Assert.Single(j.State.Notices.Values), 1003)!.Audience);
+    }
+
+    [Theory] [InlineData(1, false)] [InlineData(1, true)] [InlineData(9, false)]
+    public async Task CandidatePresentAtRecoveryCompletionIsIncludedBeforeEmission(int queuedProfiles, bool slowReports)
+    {
+        using var temp = new TempDirectory(); var clock = new Clock(); long now = clock.GetUtcNow().ToUnixTimeSeconds();
+        string setup = Identity.Hash("fixture"); Seed(temp.Path, now, binding: true);
+        using (var j = new Journal(temp.Path, Path.GetDirectoryName(temp.Path)!, default, TimeSpan.FromSeconds(3), versioned: true))
+        {
+            var engine = new Engine(j, new Model(), Identity.ServerKey("fixture"));
+            var recovery = engine.BeginRecovery(setup, now - 601);
+            j.Commit(new Change { Kind = "recovery", Recovery = recovery with { HasAddition = true } },
+                new() { Kind = "recoveryItem", RecoveryItem = new(Id(1), recovery.Id, setup) });
+        }
+        bool entered = false; var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new CompatFake { Libraries = [FixtureLibrary(now)] }; fake.Add(1);
+        ServiceHarness? running = null; var refreshes = new ConcurrentBag<Task<bool>>();
+        using var h = new ServiceHarness(temp.Path, clock, new PluginConfiguration { Enabled = true, Secret = "fixture" }, compat: fake,
+            send: async (request, ct) => {
+                if (request.RequestUri!.Segments[^1] == "bindings") {
+                    entered = true; await release.Task.WaitAsync(ct);
+                    if (slowReports) {
+                        clock.Advance(TimeSpan.FromSeconds(3));
+                        refreshes.Add(running!.Service.Bind(Id(999), "profile", UserHash, default));
+                    }
+                }
+                return ApprovalResponse(request);
+            });
+        running = h;
+        var binds = Enumerable.Range(0, queuedProfiles).Select(i => h.Service.Bind(Id(1000 + i), "profileB" + i, UserHash, default)).ToArray();
+        await h.Service.StartAsync(default);
+        try
+        {
+            await Pump(clock, () => entered); Assert.All(binds, task => Assert.False(task.IsCompleted));
+            Assert.DoesNotContain(SentEvents(h), e => e.GetProperty("op").GetString() == "summary");
+            release.SetResult();
+            // Keep CPU slices representative while the transport itself advances three seconds.
+            for (int tick = 0; tick < 2000 && !(binds.All(task => task.IsCompleted) && SentEvents(h).Count(e => e.GetProperty("op").GetString() == "summary") == queuedProfiles + 1); tick++)
+            { clock.Advance(TimeSpan.FromMilliseconds(50)); await Task.Delay(5); }
+            Assert.Equal(queuedProfiles + 1, SentEvents(h).Count(e => e.GetProperty("op").GetString() == "summary"));
+            Assert.All(await Task.WhenAll(binds), approved => Assert.True(approved));
+            Assert.Equal(Enumerable.Range(0, queuedProfiles).Select(i => "profileB" + i).Prepend("profile").Order(), SentEvents(h).Where(e => e.GetProperty("op").GetString() == "summary").Select(e => e.GetProperty("profile").GetString()).Order());
+        }
+        finally {
+            release.TrySetResult(); await h.Service.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(4));
+            await Task.WhenAll(refreshes).WaitAsync(TimeSpan.FromSeconds(4));
+        }
+    }
+
+    [Fact] public async Task RejectedRefreshStopsReportingUntilAnotherExplicitBind()
+    {
+        using var temp = new TempDirectory(); var clock = new Clock();
+        Seed(temp.Path, clock.GetUtcNow().ToUnixTimeSeconds(), binding: true);
+        bool reject = false;
+        using var h = new ServiceHarness(temp.Path, clock, new PluginConfiguration { Enabled = true, Secret = "fixture" },
+            send: (request, _) => Task.FromResult(request.RequestUri!.Segments[^1] == "bindings" && reject
+                ? new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(JsonSerializer.Serialize(new {
+                    currentRegistrations = RosterKeys(request, [Id(999)]), accepted = Array.Empty<string>() })) }
+                : ApprovalResponse(request)));
+        await h.Service.StartAsync(default);
+        try
+        {
+            await Pump(clock, () => h.Posts.Any(p => p.Route == "bindings"));
+            reject = true;
+            var bind = h.Service.Bind(Id(999), "profile", UserHash, default);
+            await Pump(clock, () => bind.IsCompleted); Assert.False(await bind);
+            int reports = h.Posts.Count(p => p.Route == "bindings");
+            for (int i = 0; i < 20; i++) { clock.Advance(TimeSpan.FromSeconds(3)); await Task.Delay(5); }
+            Assert.Equal(reports, h.Posts.Count(p => p.Route == "bindings"));
+            reject = false;
+            var retry = h.Service.Bind(Id(999), "profile", UserHash, default);
+            await Pump(clock, () => retry.IsCompleted); Assert.True(await retry);
+        }
+        finally { await h.Service.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(4)); }
+    }
+
+    private static string[] RosterKeys(HttpRequestMessage request, IEnumerable<string> registrations) =>
+        registrations.Select(id => Identity.RegistrationRosterKey(Identity.Hash(request.Headers.Authorization!.Parameter!), id)).ToArray();
+
+    private static HttpResponseMessage ApprovalResponse(HttpRequestMessage request)
+    {
+        using var json = JsonDocument.Parse(request.Content!.ReadAsStringAsync().GetAwaiter().GetResult());
+        var root = json.RootElement;
+        request.Options.TryGetValue(new HttpRequestOptionsKey<string[]>("fixture-roster"), out var roster);
+        string body = root.TryGetProperty("bindings", out var bindings) && request.RequestUri!.Segments[^1] == "bindings"
+            ? JsonSerializer.Serialize(new { currentRegistrations = RosterKeys(request, roster ?? bindings.EnumerateArray().Select(b => b.GetProperty("registration").GetString()!).ToArray()),
+                accepted = bindings.EnumerateArray().Select(b => b.GetProperty("registration").GetString()).ToArray() })
+            : root.TryGetProperty("events", out var events)
+                ? JsonSerializer.Serialize(new { accepted = events.EnumerateArray().Select(e => e.GetProperty("e").GetString()).ToArray() }) : "{}";
+        return new(HttpStatusCode.OK) { Content = new StringContent(body) };
     }
 
     private static NotificationsController Controller(NotificationService service, Guid? user)
@@ -1101,9 +1349,13 @@ public sealed class ReliabilityTests
             Relay = new RelayClient(new Handler(async (request, ct) =>
             {
                 string body = await request.Content!.ReadAsStringAsync(ct); Posts.Enqueue((request.RequestUri!.Segments[^1], body));
-                if (send is not null) return await send(request, ct);
                 using var json = JsonDocument.Parse(body);
-                return new(HttpStatusCode.OK) { Content = new StringContent(json.RootElement.TryGetProperty("events", out var events) ? JsonSerializer.Serialize(new { accepted = events.EnumerateArray().Select(e => e.GetProperty("e").GetString()).ToArray() }) : "{}") };
+                var submitted = json.RootElement.TryGetProperty("bindings", out var bindings)
+                    ? bindings.EnumerateArray().Select(b => b.GetProperty("registration").GetString()!).ToArray() : [];
+                var roster = (Service?.Snapshot.Bindings.Select(b => b.Registration) ?? []).Concat(submitted).Distinct().Take(500).ToArray();
+                request.Options.Set(new HttpRequestOptionsKey<string[]>("fixture-roster"), roster);
+                if (send is not null) return await send(request, ct);
+                return ApprovalResponse(request);
             }));
             Service = new NotificationService(Proxy<ILibraryManager>((method, args) =>
             {

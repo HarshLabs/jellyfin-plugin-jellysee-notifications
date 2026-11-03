@@ -123,3 +123,57 @@ Non-sharing failure with blocked cleanup and constructor failure → `restartReq
 - Final full .NET suite: 210 passed, 2 Windows-only sharing fixtures skipped, 212 total on macOS arm64. Python packaging suite: 3 passed. The thirty-minute virtual fault soak and 1,500-callback backlog fixture passed; no live service was used.
 - The requested companion adversarial-review command ran eight passes over the working tree. Every formal finding was CONFIRMED and fixed, with evidence above; no formal finding was REJECTED. The last pass's request-retention and cross-item invalidation fixes were verified by their focused regressions and the final full suite.
 - Existing CI OS/architecture matrix is unchanged; its build steps now enforce warnings as errors. No manifest edit, publication, server deployment or push was performed.
+
+
+## Owner-approved integration closure (2026-11-03)
+
+- Identical relay registration refreshes preserve bindings; changes to id, user, profile, server, generation, token/environment, installation or capabilities invalidate them atomically.
+- Plugin Bind completes only after relay acceptance of that tuple via the existing rate-limited reporting lane and ten-second HTTP deadline; failures return retryable 503. The app uses bounded exponential retries and withholds delivery readiness until success.
+- Current capable entitled recipients temporarily lacking a summary binding remain pending for 15 minutes from relay acceptance. Accepted bindings re-arm selection; expiry finalizes undelivered.
+- App retirement uses authenticated runtime Diagnostics (setup hash, outbox depth, last ack), keeping two distinct post-25-minute heartbeat observations and the 26-hour cap. Removed saved-config counters provide no evidence.
+- Older setups enqueue no warning/recovery while a newer setup on the same server is healthy; selection discards already queued older health jobs. Creation order defines newer, with row order breaking timestamp ties.
+- Retain 500 tuples/setup without a per-user limit. At capacity, query the authenticated current registration roster and evict the oldest absent tuple, otherwise the oldest overall; a failed roster read defers admission. Binding reports (at most 64 tuples/request) return accepted submitted ids and the current server roster as setup-scoped hashes; response bound is 32 KiB and request bounds remain unchanged.
+
+Roster privacy: each current-registration key is `hex(SHA256(UTF8("jellysee-registration-roster-v1:" + setupId + ":" + registrationId)))[0:32]`. The plugin compares retained tuples through this derivation. Reports never disclose unsubmitted opaque registration ids to independently minted setups.
+
+Authenticated succession (adversarial closure): a newer setup suppresses predecessor health alerts only after the predecessor secret authorizes it with `POST /v1/activate/jellyfin/{serverKey}`, Bearer predecessor secret, body `{"action":"supersede","successor":"<new setupId>"}` (204). The relay verifies the same server/kind and strictly newer creation order. The app links every retained predecessor after activating its reservation and before writing either plugin configuration; a failed link aborts that attempt before new heartbeats can begin. Independent public setup minting grants no authority over other setups. Summaries remain drainable on retained credentials.
+
+
+## Integration adversarial review dispositions (2026-11-03)
+
+- **CONFIRMED — premature eviction on failed Bind.** Candidates now remain in memory until their tuple is accepted by the relay. Durable replacement and the capacity eviction commit together. Evidence: `RejectedAdmissionAtCapacityPreservesEveryDurableApproval` and `BindWaitsForRelayAcceptanceAndFailureIsRetryable`.
+- **CONFIRMED — rejected/stale tuple blocks an accepted profile's summary.** Successful receipts resolve rejected tuple prerequisites without granting approval or deleting retention records. Explicit Bind can retry them. Evidence: `RejectedRegistrationCannotBlockCurrentProfilesSummaryAfterRestart`, covering absent registrations, mismatched current tuples and retained credentials after rotation/restart.
+- **CONFIRMED — capacity probes can starve delivery and ignore backoff.** Admission uses the existing batched binding lane, request budget, event reservation and Retry-After schedule; there is no separate probe lane. Evidence: `ContinuousRebindingCannotStrandAnotherUsersBindingOrEvents`, including 500-tuple cases.
+- **CONFIRMED — current-secret check rejects retained-setup receipts.** Durable approvals can acknowledge with still-valid retained credentials; current-secret authority is required separately for candidate admission and app Bind success. The rotated/restarted summary regression covers this boundary.
+- **CONFIRMED — public setup minting cannot prove succession.** Cross-setup health suppression now follows only predecessor-secret-authenticated successor links, verified against server/kind and creation order. Evidence: `an independently minted healthy setup cannot suppress a genuine setup warning`, plus both rotation warning tests (queued and not queued).
+- **CONFIRMED — linking several predecessors exhausts the five/minute setup budget.** Supersession uses the existing bounded hook budget, preserving mint/activation limits. Evidence: `links five retained setups without exhausting the production five-call setup budget`.
+- **CONFIRMED — raw roster ids weaken the opaque-id boundary.** Current roster feedback uses setup-scoped hashes; only submitted accepted ids are echoed. A shared SHA-256 test vector pins relay/plugin agreement.
+- **REJECTED:** none. All confirmed implementation findings were fixed within the integration closure.
+
+Regression evidence against archived pre-fix sources: six relay scenarios fail (unchanged registration, three unbound-window cases and two rotation warning cases); both plugin scenarios fail (Bind incorrectly completes before relay response, and the 65-profile roster cannot survive restart). Core runtime-retirement coverage omits the removed saved counter and proves retirement from the authenticated runtime object.
+
+
+Additional closure probes:
+- **CONFIRMED — on-time rebinding lost later APNs retries.** The relay persists the current tuple's first approval time and preserves it on identical reports. Routing enforces the grace deadline from that timestamp even if the first alarm is delayed. Binding receipts re-arm the inbox, and normal APNs retries survive the approval deadline. Delayed selection after an on-time rebind is also covered; a first rebind after expiry remains undelivered.
+- **CONFIRMED — queued profile admission missed the frozen recovery envelope set.** Recovery freezes a finite candidate barrier at eligibility, waits for those admissions to settle, then emits after accepted tuples commit. Later candidate churn cannot extend the barrier. Evidence: `CandidatePresentAtRecoveryCompletionIsIncludedBeforeEmission` and both at-capacity continuous-rebinding cases.
+- Four clock/rotation tests required the new accepted/roster binding receipt in their transport fixture; their event 401 behavior is preserved. All four pass with that fixture correction.
+
+- **CONFIRMED — delayed first selection bypassed approval expiry.** Durable approval timestamps reject a first binding after the grace deadline even when no alarm previously examined the summary. Existing approval timestamps survive identical reports. The delayed-first-selection regression covers the missing-alarm case.
+- **CONFIRMED — completed census could replace an approval-waiting recovery.** `BeginRecovery` retains qualifying, unemitted additions and their original audience items. Evidence: `RecoveryAdditionSurvivesACompleteCensusWhileApprovalIsPending`.
+- **CONFIRMED — slow successful binding reports consumed the recovery processing budget.** HTTP wait duration is excluded from the same bounded processing budget; each report retains its ten-second deadline. The queued-profile regression also runs with three-second successful reports and continuous rebind traffic.
+
+
+Final queue dispositions:
+- **CONFIRMED — an approval still in the bounded Bind channel could miss recovery.** The barrier now freezes the enqueue sequence and waits for every request through that boundary, including requests not yet admitted to candidates. Later arrivals cannot extend it. The nine-profile queued regression passes.
+- **CONFIRMED — an explicitly rejected refresh kept retrying automatically.** A valid receipt clears submitted refresh work whether accepted or rejected; explicit rejection resolves the prerequisite, and only another authenticated Bind retries it. Transport failures keep their backoff. Evidence: `RejectedRefreshStopsReportingUntilAnotherExplicitBind`.
+
+Final pre-commit adversarial gates: **APPROVED** in both repositories, no material findings. Every confirmed finding above is fixed; no findings were rejected.
+
+Final local validation:
+- Relay: **198/198 tests passed** across five files; `npm run typecheck` passed.
+- Plugin: `dotnet build -c Release` built **net9.0 and net10.0, zero warnings/errors**. `dotnet test -c Release --no-build`: **225 passed, 2 existing skips, 0 failed** (227 total).
+- App: **227 JellySeeCore notification/push/phase-5 tests passed**, serially through `xcslot`. **8 affected Mobile UI tests passed** on pooled iPhone 17 Pro / iOS 27 via the Full plan and `xcslot`. The arm64 tvOS simulator build passed.
+- The relay harness now isolates Worker runtimes per file and restores clocks/yields at fixture boundaries. This avoids the old shared-runtime SQLite sidecar/stack-pop race without removing assertions or tests. Heavy existing cases have explicit 30-second test deadlines; the final plain `npm test` passes.
+- No deployment, publication, push, remote migration or live Jellyfin/Seerr testing occurred. Simulator leases were returned.
+
+Both final gate reports are local artifacts at `/tmp/jsn-integration-app-review-final-gate.log` and `/tmp/jsn-integration-plugin-review-final-gate.log`. UI results: `/Users/harsh/Library/Developer/Xcode/DerivedData/JS-mobile-ui/Logs/Test/Test-JellySeeMobile-2026.11.03_02-57-05--0500.xcresult`.

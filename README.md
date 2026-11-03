@@ -27,8 +27,11 @@ Authenticated endpoints are registered under `/JellySeeNotifications`:
 - `POST /Bind`: `{"registration":"<32 lowercase hex>","profile":"profile-id"}`.
   The user comes only from the signed-in Jellyfin session. Approved tuples persist
   across restarts and are reported through the authenticated setup channel.
-  Retention is 64 registrations per user/setup and 500 per setup; admission only
-  evicts the requesting user's own oldest registration and rejects cross-user replacement.
+  Retention is 500 tuples per setup, with no per-user limit. At capacity, admission
+  evicts the oldest tuple absent from the relay's authenticated current registration
+  roster, then the oldest overall if every tuple is current. Cross-user replacement
+  of an existing registration id is rejected. Bind returns success only after the
+  relay accepts that tuple (ten-second report deadline); failure returns retryable 503.
 - `GET /Health`: exactly `{"health":"healthy"|"not","setupId":"<64 hex>"}`,
   for any signed-in user. Apps cache proof for at most ten minutes and only
   suppress polling alerts for this same setup. Public relay status is informational.

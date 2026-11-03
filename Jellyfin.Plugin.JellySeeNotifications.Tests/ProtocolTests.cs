@@ -14,6 +14,8 @@ public sealed class ProtocolTests
     {
         Assert.Equal("s1-ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", Identity.ServerKey(" ABC "));
         Assert.Equal("baa90b183b045770", Identity.UserHash(Identity.ServerKey("ABC"), Guid.ParseExact(Id(1), "N")));
+        Assert.Equal("9b94426b74d1583c27fe9f4f825234cd", Identity.RegistrationRosterKey(new string('a', 64), Id(1)));
+        Assert.NotEqual(Identity.RegistrationRosterKey(new string('a', 64), Id(1)), Identity.RegistrationRosterKey(new string('b', 64), Id(1)));
         Assert.NotEqual(Identity.ServerKey("a-b"), Identity.ServerKey("ab"));
         Assert.NotEqual(Identity.ServerKey("abc\n"), Identity.ServerKey("abc"));
         Assert.Equal(Identity.ServerKey("abc"), Identity.ServerKey("\t\u00a0ABC\u3000"));
