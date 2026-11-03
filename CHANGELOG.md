@@ -13,6 +13,9 @@
   keep recovered removals and observed moves quiet.
 - Re-probe repaired relays after non-retryable failures, and evaluate pending
   additions immediately on item updates.
+- Send ready notices in fixed one-second batches instead of waiting for a
+  minute of quiet. Keep relay backoff and the shared request limit, reserving
+  ten calls per minute for binding reports.
 - Add authenticated session-derived recipient bindings and minimal runtime
   health proof, plus elevated runtime diagnostics with a bounded, redacted ring.
   Runtime status is no longer written into saved configuration.

@@ -295,7 +295,9 @@ public sealed class NotificationService : BackgroundService
         using var pendingOwner = new PendingSignalOwner(this, pendingSignals);
         var removedThrough = new Dictionary<string, long>(StringComparer.Ordinal);
         var schedules = new Dictionary<string, SendSchedule>(StringComparer.Ordinal);
+        var batchStarted = new Dictionary<string, long>(StringComparer.Ordinal);
         var sentAt = new Queue<long>();
+        var eventSentAt = new Queue<long>();
         var bindingSentAt = new Queue<long>();
         var reportedBindings = new HashSet<string>(StringComparer.Ordinal);
         var refreshBindings = new HashSet<string>(StringComparer.Ordinal);
@@ -314,7 +316,7 @@ public sealed class NotificationService : BackgroundService
         long reportOrder = 0;
         static string ReportKey(Binding b) => b.Key + ":" + b.Profile + ":" + b.UserHash;
         string configStamp = "";
-        long? inventoryAt = null, reconcileAt = null, readyAt = null, queuedAt = null, libraryAt = null;
+        long? inventoryAt = null, reconcileAt = null, readyAt = null, libraryAt = null;
         long? oldestStamp = null, uncoveredStamp = Mono;
         string? oldestId = null;
         int emptyPolls = 0;
@@ -399,14 +401,14 @@ public sealed class NotificationService : BackgroundService
                             signal.ClockEpoch != Interlocked.Read(ref clockEpoch), signal.Coverage.Order(StringComparer.Ordinal).ToArray()))
                         { Uncover("channelDropped"); reconcileAt = null; scan = null; }
                         else scan?.Known.Add(signal.Id);
-                        queuedAt = Mono; readyRequested = true;
+                        readyRequested = true;
                     }
                     else if (signal.Op == "rm")
                     {
                         removedThrough[signal.Id] = signal.Sequence; lanes.Invalidate(signal.Id); updated.Remove(signal.Id);
                         var removedFolders = journal.State.Index.TryGetValue(signal.Id, out var title) ? title.Folders : engine.HeldRemoval(signal.Id, signal.Setup)?.Folders;
                         if (removedFolders is null || removedFolders.Length == 0 || !removedFolders.All(signal.Coverage.Contains)) origin = "recovery";
-                        engine.Remove(signal.Id, signal.EventId, signal.At, signal.Setup, origin, signal.ClockEpoch != Interlocked.Read(ref clockEpoch)); scan?.Known.Remove(signal.Id); queuedAt = Mono;
+                        engine.Remove(signal.Id, signal.EventId, signal.At, signal.Setup, origin, signal.ClockEpoch != Interlocked.Read(ref clockEpoch)); scan?.Known.Remove(signal.Id);
                     }
                     else if (signal.Op == "update")
                     {
@@ -432,7 +434,7 @@ public sealed class NotificationService : BackgroundService
                         var view = lanes.Inventory();
                         var poll = InventoryRules.Evaluate(journal.State.Libraries.Values.ToArray(), view.Libraries, true, emptyPolls);
                         emptyPolls = poll.EmptyPolls;
-                        if (poll.Complete) { lock (coverageGate) libraryRoots = view.Roots.Where(r => poll.Current.Any(l => l.Id == r.Id)).ToImmutableArray(); inventoryComplete = true; if (error == "inventoryIncomplete") SetError("none"); if (ReconcileInventory(journal, engine, poll, now, setupHash)) { reconcileAt = null; queuedAt = Mono; } }
+                        if (poll.Complete) { lock (coverageGate) libraryRoots = view.Roots.Where(r => poll.Current.Any(l => l.Id == r.Id)).ToImmutableArray(); inventoryComplete = true; if (error == "inventoryIncomplete") SetError("none"); if (ReconcileInventory(journal, engine, poll, now, setupHash)) reconcileAt = null; }
                         else { inventoryComplete = false; Uncover("inventoryIncomplete"); }
                         inventoryAt = Mono;
                     }
@@ -458,7 +460,7 @@ public sealed class NotificationService : BackgroundService
                                 if (scan.Library.BaselineComplete && !known && !HasSignalledAdd(id) && !journal.State.Health.IndexFull && !(journal.State.Tombstones.TryGetValue(id, out var tomb) && tomb.Seq > scan.StartSeq))
                                 {
                                     string origin = scan.WasCovered && now - scan.Library.CoveredUntil <= 1800 && Volatile.Read(ref covered).Contains(scan.Library.Id) ? "live" : "recovery";
-                                    engine.QueueAdd(id, item.Title.Type, Identity.EventId(), now, setupHash, origin); scan.Known.Add(id); queuedAt = Mono; readyRequested = true;
+                                    engine.QueueAdd(id, item.Title.Type, Identity.EventId(), now, setupHash, origin); scan.Known.Add(id); readyRequested = true;
                                 }
                                 if (!scan.Library.BaselineComplete || journal.State.Index.ContainsKey(id)) engine.Index(item.Title, scan.StartSeq);
                             }
@@ -598,16 +600,27 @@ public sealed class NotificationService : BackgroundService
                 }
                 // A summary waits for its profile's approvals present at creation. Later registration
                 // churn cannot move that finite barrier; legacy events do not depend on bindings.
-                var group = engine.SubmittableNotices().Where(n => n.Stage == "outbox" && (n.Op != "summary" || journal.State.Recoveries.Values.Any(r => r.Id == n.OutageId && r.Emitted) &&
+                var groups = engine.SubmittableNotices().Where(n => n.Stage == "outbox" && (n.Op != "summary" || journal.State.Recoveries.Values.Any(r => r.Id == n.OutageId && r.Emitted) &&
                         !journal.State.Bindings.Values.Any(b => b.SetupHash == n.SetupHash && b.Profile == n.Profile && b.Sequence <= n.EnqueuedSeq && !reportedBindings.Contains(ReportKey(b)) && !resolvedBindings.Contains(ReportKey(b)))) &&
                         !Rules.Expired(n, now) && credentials.ContainsKey(n.SetupHash))
-                    .GroupBy(n => n.SetupHash).Where(g => schedules[g.Key].Due(timeProvider)).OrderBy(g => schedules[g.Key].LastAttempt).FirstOrDefault();
+                    .GroupBy(n => n.SetupHash).ToArray();
+                // Fixed one-second micro-batches start with the first eligible notice per setup.
+                // Later signals/readiness cannot slide the deadline; backoff and the shared
+                // request limiter still control handoff. The loop awaits every POST serially.
+                var readySetups = groups.Select(g => g.Key).ToHashSet(StringComparer.Ordinal);
+                foreach (string hash in batchStarted.Keys.Where(hash => !readySetups.Contains(hash)).ToArray()) batchStarted.Remove(hash);
+                foreach (var readyGroup in groups) batchStarted.TryAdd(readyGroup.Key, Mono);
+                var group = groups.Where(g => schedules[g.Key].Due(timeProvider) && Due(batchStarted[g.Key], 1))
+                    .OrderBy(g => schedules[g.Key].LastAttempt).FirstOrDefault();
                 var pending = group?.OrderBy(n => n.EnqueuedSeq <= journal.State.Health.QuietThroughSeq ? 0 : 1).ThenBy(n => n.QueuedAt).ToArray() ?? [];
-                if (!tooManyUsers && pending.Length != 0 && (Due(queuedAt, 60) || now - pending[0].QueuedAt >= 300) && engine.BudgetAvailable())
+                if (!tooManyUsers && pending.Length != 0 && engine.BudgetAvailable())
                 {
                     var schedule = schedules[group!.Key];
                     while (sentAt.TryPeek(out long sent) && timeProvider.GetElapsedTime(sent) >= TimeSpan.FromMinutes(1)) sentAt.Dequeue();
-                    if (sentAt.Count < 20)
+                    while (eventSentAt.TryPeek(out long sentEvent) && timeProvider.GetElapsedTime(sentEvent) >= TimeSpan.FromMinutes(1)) eventSentAt.Dequeue();
+                    // Preserve the binding lane's existing ten-call allowance so frequent
+                    // event batches cannot strand approvals past their 15-second deadline.
+                    if (sentAt.Count < 20 && eventSentAt.Count < 10)
                     {
                         try
                         {
@@ -630,6 +643,8 @@ public sealed class NotificationService : BackgroundService
                             if (Wire.Split(host.SystemId, users, fresh).FirstOrDefault() is { } batch)
                             {
                                 sentAt.Enqueue(Mono); schedule.LastAttempt = Mono;
+                                eventSentAt.Enqueue(Mono);
+                                batchStarted.Remove(group.Key);
                                 var result = await relay.Post(config.RelayOrigin, Identity.ServerKey(host.SystemId), credentials[group.Key], "events", batch.Body, batch.Events.Select(n => n.EventId), ct);
                                 if (result.Success)
                                 { engine.Acknowledge(result.Accepted, Now); SetError("none"); schedule.Attempts = 0; schedule.Delay(timeProvider, TimeSpan.FromSeconds(result.Accepted.Count == batch.Events.Length ? 0 : 30)); }

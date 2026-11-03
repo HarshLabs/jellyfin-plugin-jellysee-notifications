@@ -783,6 +783,154 @@ public sealed class ReliabilityTests
         { using var json = JsonDocument.Parse(post.Body); foreach (var e in json.RootElement.GetProperty("events").EnumerateArray()) yield return e.Clone(); }
     }
 
+    [Fact] public async Task SingleReadyAdditionPostsWithinTwoSeconds()
+    {
+        using var temp = new TempDirectory(); var clock = new Clock(); Seed(temp.Path, clock.GetUtcNow().ToUnixTimeSeconds());
+        var fake = new CompatFake { Libraries = [FixtureLibrary(0)] }; fake.Add(1);
+        var eventTimes = new ConcurrentQueue<long>();
+        using var h = new ServiceHarness(temp.Path, clock, new PluginConfiguration { Enabled = true, Secret = "fixture" }, compat: fake,
+            send: (request, _) => { if (request.RequestUri!.Segments[^1] == "events") eventTimes.Enqueue(clock.GetTimestamp()); return Task.FromResult(ApprovalResponse(request)); });
+        await h.Service.StartAsync(default);
+        try
+        {
+            await Pump(clock, () => h.Service.CoveredLibraries.Contains(Id(8)));
+            fake.Add(2); h.EmitAdd(2);
+            await Pump(clock, () => h.Service.Snapshot.OutboxDepth == 1);
+            long ready = clock.GetTimestamp();
+            await AdvanceClock(clock, TimeSpan.FromSeconds(2));
+            Assert.Equal(Id(2), Assert.Single(SentEvents(h)).GetProperty("id").GetString());
+            Assert.InRange(clock.GetElapsedTime(ready, Assert.Single(eventTimes)), TimeSpan.Zero, TimeSpan.FromSeconds(2));
+        }
+        finally { await h.Service.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(4)); }
+    }
+
+    [Fact] public async Task FiftyAdditionsOverThreeMinutesPostThroughoutTheBurstWithinTheSharedLimiter()
+    {
+        using var temp = new TempDirectory(); var clock = new Clock(); Seed(temp.Path, clock.GetUtcNow().ToUnixTimeSeconds(), binding: true);
+        var fake = new CompatFake { Libraries = [FixtureLibrary(0)] }; fake.Add(1);
+        var attempts = new ConcurrentQueue<(string Route, long At)>();
+        using var h = new ServiceHarness(temp.Path, clock, new PluginConfiguration { Enabled = true, Secret = "fixture" }, compat: fake,
+            send: (request, _) => { attempts.Enqueue((request.RequestUri!.Segments[^1], clock.GetTimestamp())); return Task.FromResult(ApprovalResponse(request)); });
+        await h.Service.StartAsync(default);
+        try
+        {
+            await Pump(clock, () => h.Service.CoveredLibraries.Contains(Id(8)));
+            for (int i = 0; i < 50; i++)
+            {
+                fake.Add(i + 2); h.EmitAdd(i + 2);
+                // Forty early arrivals saturate the limiter; the tail continues through t=180 s.
+                // No interval leaves the old sender's 60 s quiet period.
+                if (i < 49) await AdvanceClock(clock, TimeSpan.FromSeconds(i < 39 ? 1.25 : 13.125));
+            }
+            await AdvanceClock(clock, TimeSpan.FromSeconds(5));
+            Assert.Equal(50, SentEvents(h).Count());
+            Assert.True(attempts.Count(p => p.Route == "events") >= 15);
+            var limited = attempts.Where(p => p.Route is "events" or "bindings").Select(p => p.At).ToArray();
+            Assert.All(limited, at => Assert.InRange(limited.Count(t => t > at - TimeSpan.FromMinutes(1).Ticks && t <= at), 1, 20));
+            var events = attempts.Where(p => p.Route == "events").Select(p => p.At).ToArray();
+            Assert.All(events, at => Assert.InRange(events.Count(t => t > at - TimeSpan.FromMinutes(1).Ticks && t <= at), 1, 10));
+            Assert.All(h.Posts.Where(p => p.Route == "events"), p =>
+            {
+                Assert.InRange(System.Text.Encoding.UTF8.GetByteCount(p.Body), 1, 48 * 1024);
+                using var json = JsonDocument.Parse(p.Body); Assert.InRange(json.RootElement.GetProperty("events").GetArrayLength(), 1, 50);
+            });
+        }
+        finally { await h.Service.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(4)); }
+    }
+
+    [Fact] public async Task SimultaneousReadyResultsShareOnePostWithoutWaitingForLaterUnreadySignals()
+    {
+        using var temp = new TempDirectory(); var clock = new Clock(); Seed(temp.Path, clock.GetUtcNow().ToUnixTimeSeconds());
+        var fake = new CompatFake { Libraries = [FixtureLibrary(0)] }; fake.Add(1);
+        using var h = new ServiceHarness(temp.Path, clock, new PluginConfiguration { Enabled = true, Secret = "fixture" }, compat: fake);
+        await h.Service.StartAsync(default);
+        try
+        {
+            await Pump(clock, () => h.Service.CoveredLibraries.Contains(Id(8)));
+            for (int i = 2; i <= 11; i++) { fake.Add(i); h.EmitAdd(i); }
+            // Wait in small fake-clock steps so asynchronous library lanes settle within the batch window.
+            for (int i = 0; i < 80 && h.Service.Snapshot.OutboxDepth < 10; i++) await AdvanceClock(clock, TimeSpan.FromMilliseconds(25));
+            Assert.Equal(10, h.Service.Snapshot.OutboxDepth);
+            fake.ReadyValue = false;
+            for (int i = 12; i < 16; i++) { fake.Add(i); h.EmitAdd(i); await AdvanceClock(clock, TimeSpan.FromMilliseconds(500)); }
+            Assert.Equal(10, SentEvents(h).Count());
+            Assert.Single(h.Posts, p => p.Route == "events");
+        }
+        finally { await h.Service.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(4)); }
+    }
+
+    private static async Task AdvanceClock(Clock clock, TimeSpan duration)
+    {
+        while (duration > TimeSpan.Zero)
+        {
+            var step = duration < TimeSpan.FromMilliseconds(50) ? duration : TimeSpan.FromMilliseconds(50);
+            clock.Advance(step); duration -= step; await Task.Delay(5);
+        }
+    }
+
+    [Fact] public async Task NewReadyNoticesCannotOverlapAnInflightPostOrBypassRetryAfter()
+    {
+        using var temp = new TempDirectory(); var clock = new Clock(); Seed(temp.Path, clock.GetUtcNow().ToUnixTimeSeconds());
+        var fake = new CompatFake { Libraries = [FixtureLibrary(0)] }; fake.Add(1);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int active = 0, maximum = 0, attempts = 0; long retryAt = 0;
+        using var h = new ServiceHarness(temp.Path, clock, new PluginConfiguration { Enabled = true, Secret = "fixture" }, compat: fake,
+            send: async (request, ct) =>
+            {
+                if (request.RequestUri!.Segments[^1] != "events") return ApprovalResponse(request);
+                maximum = Math.Max(maximum, Interlocked.Increment(ref active));
+                try
+                {
+                    if (Interlocked.Increment(ref attempts) != 1) return ApprovalResponse(request);
+                    await release.Task.WaitAsync(ct); retryAt = clock.GetTimestamp();
+                    return new(HttpStatusCode.TooManyRequests) { Headers = { RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(TimeSpan.FromSeconds(60)) } };
+                }
+                finally { Interlocked.Decrement(ref active); }
+            });
+        await h.Service.StartAsync(default);
+        try
+        {
+            await Pump(clock, () => h.Service.CoveredLibraries.Contains(Id(8)));
+            fake.Add(2); h.EmitAdd(2); await Pump(clock, () => Volatile.Read(ref attempts) == 1);
+            fake.Add(3); h.EmitAdd(3); await AdvanceClock(clock, TimeSpan.FromSeconds(2));
+            Assert.Equal(1, Volatile.Read(ref attempts)); Assert.Equal(1, Volatile.Read(ref active));
+            release.SetResult(); await Until(() => h.Service.Snapshot.ErrorCode == "relayUnreachable");
+            await AdvanceClock(clock, TimeSpan.FromSeconds(59)); Assert.Equal(1, Volatile.Read(ref attempts));
+            await AdvanceClock(clock, TimeSpan.FromSeconds(2));
+            Assert.Equal(2, Volatile.Read(ref attempts)); Assert.Equal(1, maximum);
+            Assert.True(clock.GetElapsedTime(retryAt) >= TimeSpan.FromSeconds(60));
+            Assert.Equal(2, SentEvents(h).Select(e => e.GetProperty("id").GetString()).Distinct().Count());
+        }
+        finally { release.TrySetResult(); await h.Service.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(4)); }
+    }
+
+    [Fact] public async Task FrequentEventBatchesAllowStaggeredBindingApprovalsBeforeTheirDeadlines()
+    {
+        using var temp = new TempDirectory(); var clock = new Clock(); Seed(temp.Path, clock.GetUtcNow().ToUnixTimeSeconds());
+        var fake = new CompatFake { Libraries = [FixtureLibrary(0)] }; fake.Add(1);
+        using var h = new ServiceHarness(temp.Path, clock, new PluginConfiguration { Enabled = true, Secret = "fixture" }, compat: fake);
+        await h.Service.StartAsync(default);
+        try
+        {
+            await Pump(clock, () => h.Service.CoveredLibraries.Contains(Id(8)));
+            long start = clock.GetTimestamp();
+            for (int i = 2; i < 122 && h.Posts.Count(p => p.Route == "events") < 10; i++)
+            { fake.Add(i); h.EmitAdd(i); await AdvanceClock(clock, TimeSpan.FromSeconds(1)); }
+            Assert.Equal(10, h.Posts.Count(p => p.Route == "events"));
+            Assert.True(clock.GetElapsedTime(start) < TimeSpan.FromSeconds(35));
+            for (int i = 0; i < 10; i++)
+            {
+                fake.Add(200 + i); h.EmitAdd(200 + i);
+                var bind = h.Service.Bind(Id(999 + i), "profile", UserHash, default);
+                for (int tick = 0; tick < 300 && !bind.IsCompleted; tick++) await AdvanceClock(clock, TimeSpan.FromMilliseconds(50));
+                Assert.True(bind.IsCompletedSuccessfully, "Event traffic must allow each staggered binding admission before its 15-second deadline.");
+                Assert.True(await bind);
+            }
+            Assert.Equal(10, h.Posts.Count(p => p.Route == "bindings"));
+        }
+        finally { await h.Service.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(4)); }
+    }
+
     [Fact] public async Task FifteenHundredQueuedCallbacksDrainWithoutReissuingCompletedReads()
     {
         using var temp = new TempDirectory(); var clock = new Clock(); Seed(temp.Path, clock.GetUtcNow().ToUnixTimeSeconds());
