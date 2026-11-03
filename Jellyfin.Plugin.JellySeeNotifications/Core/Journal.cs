@@ -42,14 +42,17 @@ public sealed class Journal : IDisposable
             io.Invoke(() =>
             {
                 string original = directory;
-                if (versioned) directory = Path.Combine(directory, "v5");
+                if (versioned) directory = Path.Combine(directory, "v6");
                 files = new StateDirectory(directory, pluginDataPath ?? Path.GetDirectoryName(Path.GetFullPath(directory))!, io.Token);
                 if (versioned && files.Length("migration.complete") == 0)
                 {
                     string migrationSource = original;
-                    string previous = Path.Combine(original, "v4");
-                    using (var prior = new StateDirectory(previous, pluginDataPath ?? Path.GetDirectoryName(Path.GetFullPath(original))!, io.Token))
-                        if (prior.Length("migration.complete") != 0) migrationSource = previous;
+                    foreach (string version in new[] { "v5", "v4" })
+                    {
+                        string previous = Path.Combine(original, version);
+                        using var prior = new StateDirectory(previous, pluginDataPath ?? Path.GetDirectoryName(Path.GetFullPath(original))!, io.Token);
+                        if (prior.Length("migration.complete") != 0) { migrationSource = previous; break; }
+                    }
                     using var source = new StateDirectory(migrationSource, pluginDataPath ?? Path.GetDirectoryName(Path.GetFullPath(original))!, io.Token);
                     foreach (string name in new[] { "snapshot.bin", "journal.ndjson" })
                     {
@@ -57,7 +60,7 @@ public sealed class Journal : IDisposable
                         if (old is not null) { if (old.Length > MaxFile) throw new InvalidDataException("Migration cap"); using var copy = files.Rewrite(name, old, old.Length); }
                     }
                     // Publish only after a complete imported snapshot. A failed import is retried from untouched predecessor files.
-                    Load();
+                    Load(predecessor: true);
                     if (migrationSource == original)
                         foreach (var n in State.Notices.Values.ToArray()) State.Apply(new() { Kind = "notice", Notice = n with { Origin = "recovery", FirstSeenAt = n.FirstSeenAt == 0 ? n.QueuedAt : n.FirstSeenAt } });
                     CompactCore();
@@ -115,8 +118,9 @@ public sealed class Journal : IDisposable
         return bytes;
     }
     private static void WriteLine(FileStream output, byte[] bytes) { output.Write(bytes); output.WriteByte((byte)'\n'); }
-    private void Load()
+    private void Load(bool predecessor = false)
     {
+        State.ReplayLegacyBulk = predecessor;
         using var snapshot = files.Read("snapshot.bin");
         if (snapshot is not null)
         {
@@ -126,7 +130,7 @@ public sealed class Journal : IDisposable
                 if (input.Length > MaxFile) throw new InvalidDataException("Snapshot cap");
                 var header = Decode<Header>(Line(input) ?? throw new InvalidDataException());
                 if (header.Format != 3 || header.Seq < 0) throw new InvalidDataException();
-                State restored = new(); long count = 0;
+                State restored = new() { ReplayLegacyBulk = predecessor }; long count = 0;
                 using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
                 while (true)
                 {
@@ -170,7 +174,7 @@ public sealed class Journal : IDisposable
             }
         }
         using var log = files.Read("journal.ndjson");
-        if (log is null) { writer = files.Rewrite("journal.ndjson", null, 0); return; }
+        if (log is null) { writer = files.Rewrite("journal.ndjson", null, 0); State.ReplayLegacyBulk = false; return; }
         long good = 0;
         try
         {
@@ -195,6 +199,7 @@ public sealed class Journal : IDisposable
         // Recovery and future appends use a fresh exclusive inode. Existing hard
         // links cannot turn a replay-tail repair into an outside-file truncation.
         writer = files.Rewrite("journal.ndjson", log, good, closeInput: true);
+        State.ReplayLegacyBulk = false;
     }
     public void Commit(params Change[] changes)
     {

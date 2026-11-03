@@ -3,9 +3,10 @@ using System.Text.Json;
 
 namespace Jellyfin.Plugin.JellySeeNotifications.Core;
 
+public sealed record CoverageProof(string Id, [property: JsonConverter(typeof(CoverageConverter))] string[] Folders);
 public sealed record Title(string Id, string Type, string[] Folders, string? ProviderDigest, long Seq, int Life);
 public sealed record Lifecycle(string Id, int Life);
-public sealed record AddObligation(string EventId, long FirstSeenAt, string SetupHash, string? OutageId = null, long EnqueuedSeq = 0);
+public sealed record AddObligation(string EventId, long FirstSeenAt, string SetupHash, string? OutageId = null, long EnqueuedSeq = 0, string? CoverageId = null);
 public sealed record Tombstone(string Id, long Seq, long At, int Life, AddObligation? UnannouncedAdd = null);
 public sealed record Addition(string Id, string Type, string[] Folders, string? ProviderDigest, long At, string SetupHash = "");
 // Directory and location fingerprints preserve rename detection without persisting filesystem paths.
@@ -17,6 +18,7 @@ public sealed record Change
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool ExcludePendingReadds { get; init; }
     public Notice? Notice { get; init; }
+    public CoverageProof? Coverage { get; init; }
     public Title? Title { get; init; }
     public Lifecycle? Lifecycle { get; init; }
     public Tombstone? Tombstone { get; init; }
@@ -32,6 +34,9 @@ public sealed record Change
 public sealed class State
 {
     public const int Capacity = 5000;
+    internal bool ReplayLegacyBulk { get; set; }
+    public const int CoverageFolderCapacity = 64_000;
+    public Dictionary<string, CoverageProof> Coverages { get; } = new(StringComparer.Ordinal);
     public const int IndexCapacity = 200_000;
     public const int LifecycleCapacity = 1_000_000;
     public Dictionary<string, int> Lifecycles { get; } = new(StringComparer.Ordinal);
@@ -76,6 +81,7 @@ public sealed class State
             itemKeys = itemKeys.Concat(RecoveryItems.Values.Where(r => setupsRemoved.Contains(r.SetupHash) || outagesRemoved.Contains(r.OutageId)).Select(r => r.Key));
         var recoveryItems = Capture(RecoveryItems, itemKeys.Distinct(StringComparer.Ordinal));
         void RestoreRecovery() { Restore(Bindings, bindings); Restore(Recoveries, recoveries); Restore(RecoveryItems, recoveryItems); }
+        var proofs = Capture(Coverages, changes.Where(c => c.Kind is "coverage" or "uncoverage").Select(c => c.Coverage?.Id ?? c.Key!).Distinct(StringComparer.Ordinal));
         var adds = Capture(Additions, addKeys); var libs = Capture(Libraries, libKeys); var health = Health;
         void RestoreNotices()
         {
@@ -83,8 +89,8 @@ public sealed class State
             else { Notices.Clear(); foreach (var pair in allNotices) Notices.Add(pair.Key, pair.Value); }
         }
         try { foreach (var c in changes) { ApplyCore(c); ValidateInvariants(); } ValidateInvariants(); }
-        catch { RestoreRecovery(); RestoreNotices(); Restore(Index, ts); Restore(Tombstones, ds); Restore(Additions, adds); Restore(Libraries, libs); Health = health; RestoreLives(); throw; }
-        if (dryRun) { RestoreRecovery(); RestoreNotices(); Restore(Index, ts); Restore(Tombstones, ds); Restore(Additions, adds); Restore(Libraries, libs); Health = health; RestoreLives(); }
+        catch { Restore(Coverages, proofs); RestoreRecovery(); RestoreNotices(); Restore(Index, ts); Restore(Tombstones, ds); Restore(Additions, adds); Restore(Libraries, libs); Health = health; RestoreLives(); throw; }
+        if (dryRun) { Restore(Coverages, proofs); RestoreRecovery(); RestoreNotices(); Restore(Index, ts); Restore(Tombstones, ds); Restore(Additions, adds); Restore(Libraries, libs); Health = health; RestoreLives(); }
     }
     private static void ValidateChangeShape(Change c)
     {
@@ -92,6 +98,7 @@ public sealed class State
         // from the record that ApplyCore will actually mutate.
         if (c is null || c.ExcludePendingReadds && c.Kind != "bulk" || (c.Notice is not null) != (c.Kind is "notice" or "bulk") ||
             (c.Title is not null) != (c.Kind == "title") ||
+            (c.Coverage is not null) != (c.Kind == "coverage") ||
             (c.Lifecycle is not null) != (c.Kind == "life") ||
             (c.Tombstone is not null) != (c.Kind == "remove") ||
             (c.Addition is not null) != (c.Kind == "addition") ||
@@ -100,7 +107,7 @@ public sealed class State
             (c.Binding is not null) != (c.Kind == "binding") ||
             (c.Recovery is not null) != (c.Kind == "recovery") ||
             (c.RecoveryItem is not null) != (c.Kind == "recoveryItem") ||
-            (c.Key is not null) != (c.Kind is "bulk" or "retire" or "untombstone" or "unaddition" or "unroute" or "reroute" or "unlibrary" or "unrecoveryItem" or "unsetup" or "unbinding" or "unoutage"))
+            (c.Key is not null) != (c.Kind is "bulk" or "retire" or "untombstone" or "unaddition" or "unroute" or "reroute" or "unlibrary" or "unrecoveryItem" or "unsetup" or "unbinding" or "unoutage" or "uncoverage"))
             throw new InvalidDataException("Invalid change shape");
     }
     private static Dictionary<string, T?> Capture<T>(Dictionary<string, T> source, IEnumerable<string> keys) where T : class => keys.ToDictionary(k => k, k => source.GetValueOrDefault(k), StringComparer.Ordinal);
@@ -110,27 +117,36 @@ public sealed class State
     public void ValidateInvariants()
     {
         int outbox = Notices.Values.Count(n => n.Stage == "outbox");
-        if (outbox > Capacity || Notices.Count - outbox > Capacity || Notices.Count > 2 * Capacity ||
+        if (Coverages.Count > Capacity || Coverages.Values.Sum(p => p.Folders.Length) > CoverageFolderCapacity || outbox > Capacity || Notices.Count - outbox > Capacity || Notices.Count > 2 * Capacity ||
             Index.Count > IndexCapacity || Tombstones.Count > IndexCapacity || Additions.Count > Capacity ||
             Bindings.Count > 10_000 || Recoveries.Count > 20 || RecoveryItems.Count > IndexCapacity || Lifecycles.Count > LifecycleCapacity || Libraries.Count > 2000)
             throw new InvalidDataException("State cap");
     }
-    private static void ValidateNotice(Notice notice)
+    private void ValidateNotice(Notice notice)
     {
         Wire.Validate(notice);
-        if (notice.ReaddObservedAt is < 0 || notice.ReaddObservedAt is not null && notice.Op != "rm" || notice.ReadyAt < 0 || notice.EnqueuedSeq < 0 || !Digest(notice.ProviderDigest) || !Setup(notice.SetupHash) || notice.Stage is not ("pendingAdd" or "pendingRemove" or "outbox") ||
+        if (!Coverage(notice.CoverageId) || notice.LegacyReaddObservedAt is < 0 || notice.LegacyReaddObservedAt is not null && notice.Op != "rm" || notice.ReadyAt < 0 || notice.EnqueuedSeq < 0 || !Digest(notice.ProviderDigest) || !Setup(notice.SetupHash) || notice.Stage is not ("pendingAdd" or "pendingRemove" or "outbox") ||
             notice.Stage == "pendingAdd" && notice.Op != "add" || notice.Stage == "pendingRemove" && notice.Op != "rm")
             throw new InvalidDataException("Invalid notice state");
     }
+    private bool Coverage(string? id) => string.IsNullOrEmpty(id) || Coverages.ContainsKey(id);
     private static bool Setup(string? value) => value is not null && (value.Length == 0 || value.Length == 64 && value.All(Uri.IsHexDigit));
     private void ApplyCore(Change c)
     {
         switch (c.Kind)
         {
+            case "coverage":
+                var proof = c.Coverage!;
+                if (proof.Folders.Length > 2000 || proof.Folders.Any(f => !Identity.IsId(f)) || !proof.Folders.SequenceEqual(proof.Folders.Distinct().Order(StringComparer.Ordinal)) || proof.Id != Identity.Hash(string.Concat(proof.Folders))) throw new InvalidDataException("Invalid coverage");
+                Coverages[proof.Id] = proof; break;
+            case "uncoverage":
+                if (Notices.Values.Any(n => n.CoverageId == c.Key) || Tombstones.Values.Any(t => t.UnannouncedAdd?.CoverageId == c.Key)) throw new InvalidDataException("Referenced coverage");
+                Coverages.Remove(c.Key!); break;
             case "notice":
                 if (c.Notice is null) throw new InvalidDataException();
                 ValidateNotice(c.Notice);
-                if (Notices.TryGetValue(c.Notice.EventId, out var prior) && (prior.FirstSeenAt != c.Notice.FirstSeenAt || prior.Origin != c.Notice.Origin || prior.EnqueuedSeq != c.Notice.EnqueuedSeq)) throw new InvalidDataException("Immutable provenance");
+                if (Notices.TryGetValue(c.Notice.EventId, out var prior) && (prior.FirstSeenAt != c.Notice.FirstSeenAt || prior.Origin != c.Notice.Origin || prior.EnqueuedSeq != c.Notice.EnqueuedSeq ||
+                    prior.CoverageId != c.Notice.CoverageId)) throw new InvalidDataException("Immutable provenance");
                 Notices[c.Notice.EventId] = c.Notice;
                 break;
             case "bulk":
@@ -138,8 +154,8 @@ public sealed class State
                 ValidateNotice(bulk);
                 if (bulk.Op != "rmbulk" || bulk.Stage != "outbox" || !long.TryParse(c.Key, out long end) || end < bulk.QueuedAt || end - bulk.QueuedAt > 600)
                     throw new InvalidDataException("Invalid bulk window");
-                var bulkHolds = c.ExcludePendingReadds ? Rules.PendingReadds(Notices.Values) : null;
-                var members = Notices.Values.Where(n => n.Stage == "pendingRemove" && (bulkHolds is null || !Rules.AwaitingReadd(n, bulkHolds)) && n.SetupHash == bulk.SetupHash && n.Origin == bulk.Origin && n.Quiet == bulk.Quiet && n.QueuedAt >= bulk.QueuedAt && n.QueuedAt <= end && n.Folders.Contains(bulk.Folders[0])).ToArray();
+                var bulkHolds = c.ExcludePendingReadds ? Rules.PendingReadds(Notices.Values, Index, ReplayLegacyBulk) : null;
+                var members = Notices.Values.Where(n => n.Stage == "pendingRemove" && (bulkHolds is null || !Rules.AwaitingReadd(n, bulkHolds, ReplayLegacyBulk)) && n.SetupHash == bulk.SetupHash && n.Origin == bulk.Origin && n.Quiet == bulk.Quiet && n.QueuedAt >= bulk.QueuedAt && n.QueuedAt <= end && n.Folders.Contains(bulk.Folders[0])).ToArray();
                 if (members.Length <= 200 || bulk.Count != members.Length || !members.Any(n => n.EventId == bulk.EventId))
                     throw new InvalidDataException("Invalid bulk members");
                 foreach (var member in members)
@@ -170,7 +186,7 @@ public sealed class State
             case "remove":
                 var tomb = c.Tombstone ?? throw new InvalidDataException();
                 RequireId(tomb.Id); if (tomb.Life < 0 || tomb.Seq < 0 || tomb.At < 0) throw new InvalidDataException();
-                if (tomb.UnannouncedAdd is { } owed && (!Identity.IsId(owed.EventId) || owed.FirstSeenAt < 0 || owed.EnqueuedSeq < 0 || !Setup(owed.SetupHash) || owed.OutageId is not null && !Identity.IsId(owed.OutageId))) throw new InvalidDataException();
+                if (tomb.UnannouncedAdd is { } owed && (!Identity.IsId(owed.EventId) || owed.FirstSeenAt < 0 || owed.EnqueuedSeq < 0 || !Setup(owed.SetupHash) || !Coverage(owed.CoverageId) || owed.OutageId is not null && !Identity.IsId(owed.OutageId))) throw new InvalidDataException();
                 if (!Lifecycles.ContainsKey(tomb.Id) && Lifecycles.Count >= LifecycleCapacity) throw new InvalidDataException("Lifecycle cap");
                 Lifecycles[tomb.Id] = Math.Max(Lifecycles.GetValueOrDefault(tomb.Id), tomb.Life);
                 Tombstones[tomb.Id] = tomb; Index.Remove(tomb.Id);
@@ -240,6 +256,7 @@ public sealed class State
     private static string RequireId(string? id) => Identity.IsId(id) ? id! : throw new InvalidDataException();
     public IEnumerable<Change> Snapshot()
     {
+        foreach (var proof in Coverages.Values) yield return new() { Kind = "coverage", Coverage = proof };
         yield return new() { Kind = "health", Health = Health };
         foreach (var b in Bindings.Values) yield return new() { Kind = "binding", Binding = b };
         foreach (var r in Recoveries.Values) yield return new() { Kind = "recovery", Recovery = r };
@@ -256,8 +273,8 @@ public sealed class State
 public static class Rules
 {
     public const int MoveWindow = 600;
-    public static ILookup<(string? Id, string Setup), Notice> PendingReadds(IEnumerable<Notice> notices) => notices.Where(a => a.Stage == "pendingAdd").ToLookup(a => (a.Id, a.SetupHash));
-    public static bool AwaitingReadd(Notice removal, ILookup<(string? Id, string Setup), Notice> pending) => removal.ReaddObservedAt is not null || !removal.Quiet && pending[(removal.Id, removal.SetupHash)].Any(a => a.QueuedAt >= removal.FirstSeenAt && a.QueuedAt - removal.FirstSeenAt < MoveWindow);
+    public static ILookup<(string? Id, string Setup), Notice> PendingReadds(IEnumerable<Notice> notices, IReadOnlyDictionary<string, Title> index, bool legacy = false) => notices.Where(a => a.Stage == "pendingAdd" && (legacy || !index.ContainsKey(a.Id!))).ToLookup(a => (a.Id, a.SetupHash));
+    public static bool AwaitingReadd(Notice removal, ILookup<(string? Id, string Setup), Notice> pending, bool legacy = false) => removal.LegacyReaddObservedAt is not null || (!legacy || !removal.Quiet) && pending[(removal.Id, removal.SetupHash)].Any(a => a.QueuedAt >= removal.FirstSeenAt && a.QueuedAt - removal.FirstSeenAt < MoveWindow);
     public static bool Audible(Notice n, long now) => n.Origin == "live" && !n.Quiet && now - n.FirstSeenAt <= 1800 && n.FirstSeenAt <= now + 120;
     public static bool Ready(string type, bool providers, bool refreshed, long queuedAt, long now) =>
         now - queuedAt >= 900 || refreshed && (type is "Book" or "AudioBook" || providers);

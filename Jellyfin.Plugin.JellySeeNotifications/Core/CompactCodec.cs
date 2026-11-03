@@ -5,15 +5,19 @@ using System.Text.Json.Serialization;
 namespace Jellyfin.Plugin.JellySeeNotifications.Core;
 
 // Packed audience hashes keep a worst-case 5,000-event / 2,000-user outbox bounded on disk.
-public sealed class AudienceConverter : JsonConverter<string[]>
+public sealed class AudienceConverter() : PackedIdsConverter(8);
+public sealed class CoverageConverter() : PackedIdsConverter(16);
+
+// Shared coverage proofs contain at most 2,000 folder IDs and fit one bounded journal record.
+public class PackedIdsConverter(int width) : JsonConverter<string[]>
 {
     public override string[] Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
-        if (reader.TokenType != JsonTokenType.String || reader.ValueSpan.Length > 21336) throw new JsonException("Audience cap");
+        if (reader.TokenType != JsonTokenType.String || reader.ValueSpan.Length > ((2000 * width + 2) / 3) * 4) throw new JsonException("ID cap");
         byte[] bytes = reader.GetBytesFromBase64();
-        if (bytes.Length > 16000 || bytes.Length % 8 != 0) throw new JsonException("Invalid audience");
-        string[] result = new string[bytes.Length / 8];
-        for (int i = 0; i < result.Length; i++) result[i] = Convert.ToHexStringLower(bytes.AsSpan(i * 8, 8));
+        if (bytes.Length > 2000 * width || bytes.Length % width != 0) throw new JsonException("Invalid IDs");
+        string[] result = new string[bytes.Length / width];
+        for (int i = 0; i < result.Length; i++) result[i] = Convert.ToHexStringLower(bytes.AsSpan(i * width, width));
         return result;
     }
     public override void Write(Utf8JsonWriter writer, string[] value, JsonSerializerOptions options) => writer.WriteBase64StringValue(value.SelectMany(Convert.FromHexString).ToArray());

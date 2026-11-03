@@ -30,6 +30,7 @@ public sealed class ReliabilityTests
         internal bool Allowed = true;
         internal bool Unknown;
         internal bool ReadPending;
+        internal int ReadCalls;
         internal bool AsyncAudience;
         internal long? SampleAt;
         public long AudienceEvaluatedAt(string id, long now) => SampleAt ?? now;
@@ -42,7 +43,7 @@ public sealed class ReliabilityTests
         }
         public bool ScanRunning { get; set; }
         internal void Add(int id, string? digest = null, string? folder = null) => Items[Id(id)] = new(new(Id(id), "Movie", [folder ?? Id(8)], digest, 0, 0), true, null);
-        public ItemSnapshot? Read(string id, long queuedAt, long now) => ReadPending ? throw new LibraryPendingException() : Items.GetValueOrDefault(id);
+        public ItemSnapshot? Read(string id, long queuedAt, long now) { ReadCalls++; return ReadPending ? throw new LibraryPendingException() : Items.GetValueOrDefault(id); }
         public string[] Audience(string? id, string[] folders, long now)
         {
             if (Unknown) throw new LibraryCallException();
@@ -108,7 +109,7 @@ public sealed class ReliabilityTests
         using (var j = new Journal(temp.Path))
         {
             var e = new Engine(j, m, "key"); e.QueueAdd(Id(1), "Movie", Id(100), 1000, Setup); e.AdvanceAdds(1001, _ => { });
-            e.Remove(Id(1), Id(101), 1002, Setup); e.ObserveReadd(Id(1), 1100, Setup); e.Remove(Id(1), Id(102), 1101, Setup); j.Compact();
+            e.Remove(Id(1), Id(101), 1002, Setup); e.QueueAdd(Id(1), "Movie", Id(199), 1100, Setup); e.Remove(Id(1), Id(102), 1101, Setup); j.Compact();
         }
         using var restored = new Journal(temp.Path); var resumed = new Engine(restored, m, "key");
         resumed.QueueAdd(Id(1), "Movie", Id(103), 1102, Setup); resumed.AdvanceAdds(1103, _ => { });
@@ -144,29 +145,191 @@ public sealed class ReliabilityTests
         var restored = j.State.Notices[Id(100)]; Assert.Equal(sequence, restored.EnqueuedSeq); Assert.True(restored.Quiet); Assert.True(restored.Folded);
     }
 
-    [Fact] public void CallbackObservationHoldsRemovalBeforeItsFirstMetadataRead()
+    [Theory] [InlineData(false)] [InlineData(true)]
+    public void PendingCallbackHoldsRemovalBeforeItsFirstMetadataRead(bool quiet)
     {
         using var temp = new TempDirectory(); using var j = new Journal(temp.Path); var m = new Model(); m.Add(1);
-        var e = new Engine(j, m, "key"); e.Index(m.Items[Id(1)].Title); e.Remove(Id(1), Id(100), 1000, Setup);
-        e.ObserveReadd(Id(1), 1500, Setup); m.ReadPending = true; // NotificationService does this before lanes.Read.
+        var e = new Engine(j, m, "key"); e.Index(m.Items[Id(1)].Title); e.Remove(Id(1), Id(100), 1000, Setup, quiet: quiet);
+        e.QueueAdd(Id(1), "Movie", Id(199), 1500, Setup); m.ReadPending = true;
         e.AdvanceRemovals(1601, _ => { }); Assert.Equal("pendingRemove", j.State.Notices[Id(100)].Stage);
         e.Remove(Id(1), Id(101), 1602, Setup); e.AdvanceRemovals(2203, _ => { });
         var final = Assert.Single(j.State.Notices.Values); Assert.Equal(Id(101), final.EventId); Assert.Equal("outbox", final.Stage); Assert.False(final.Quiet);
     }
 
     [Theory] [InlineData(false)] [InlineData(true)]
-    public void RestartResumesObservationWhoseInitialReadWasNeverQueued(bool present)
+    public void RestartResumesPendingCallbackBeforeItsFirstMetadataRead(bool present)
     {
         using var temp = new TempDirectory(); var m = new Model(); m.Add(1);
         using (var j = new Journal(temp.Path))
         {
             var e = new Engine(j, m, "key"); e.Index(m.Items[Id(1)].Title); e.Remove(Id(1), Id(100), 1000, Setup);
-            e.ObserveReadd(Id(1), 1001, Setup); j.Compact();
+            e.QueueAdd(Id(1), "Movie", Id(199), 1001, Setup); j.Compact();
         }
         if (!present) m.Items.Remove(Id(1));
-        using var resumed = new Journal(temp.Path); new Engine(resumed, m, "key").AdvanceRemovals(1601, _ => { });
+        using var resumed = new Journal(temp.Path); var engine = new Engine(resumed, m, "key"); engine.AdvanceAdds(1601, _ => { }); engine.AdvanceRemovals(1601, _ => { });
         var notice = Assert.Single(resumed.State.Notices.Values); Assert.Equal("outbox", notice.Stage);
         Assert.Equal(present ? "add" : "rm", notice.Op); if (present) Assert.True(notice.Quiet);
+    }
+
+    [Theory] [InlineData("live", false)] [InlineData("recovery", false)] [InlineData("live", true)]
+    public void CallbackAdmissionDoesNotReadMetadata(string origin, bool folded)
+    {
+        using var temp = new TempDirectory(); using var j = new Journal(temp.Path); var m = new Model(); m.Add(1);
+        var e = new Engine(j, m, "key"); e.QueueAdd(Id(1), "Movie", Id(100), 1000, Setup, origin, folded, [Id(8)]);
+        Assert.Equal(0, m.ReadCalls);
+        Assert.Equal("pendingAdd", j.State.Notices[Id(100)].Stage);
+        e.AdvanceAdds(1001, _ => { }); Assert.Equal(1, m.ReadCalls);
+    }
+
+    [Fact] public void MaximumReceiptCoverageFitsAtomicOriginalAndRepairAndSnapshot()
+    {
+        using var temp = new TempDirectory(); var m = new Model();
+        string[] coverage = Enumerable.Range(1, 2000).Select(Id).ToArray();
+        using (var j = new Journal(temp.Path))
+        {
+            var e = new Engine(j, m, "key");
+            e.QueueAdd(Id(1), "Movie", Id(100), 1000, Setup, receiptCoverage: coverage);
+            e.Remove(Id(1), Id(101), 1001, Setup);
+            e.QueueAdd(Id(1), "Movie", Id(102), 1002, Setup, receiptCoverage: coverage); j.Compact();
+        }
+        using var resumed = new Journal(temp.Path);
+        Assert.False(resumed.RecoveredCorruption); Assert.Equal(2, resumed.State.Notices.Count);
+        Assert.Single(resumed.State.Coverages);
+        Assert.All(resumed.State.Notices.Values, n => Assert.Equal(coverage, resumed.State.Coverages[n.CoverageId!].Folders));
+    }
+
+    [Fact] public void MaximumPendingAndTombstoneWorkSharesCoverageAndCompactsAcrossRestart()
+    {
+        using var temp = new TempDirectory(); var m = new Model(); string proof;
+        using (var j = new Journal(temp.Path))
+        {
+            var e = new Engine(j, m, "key");
+            e.QueueAdd(Id(1), "Movie", Id(10001), 1000, Setup, receiptCoverage: Enumerable.Range(1, 2000).Select(Id).ToArray());
+            var template = j.State.Notices[Id(10001)]; proof = template.CoverageId!;
+            foreach (var chunk in Enumerable.Range(2, State.Capacity - 1).Chunk(100))
+                j.Commit(chunk.Select(i => new Change { Kind = "notice", Notice = template with { Id = Id(i), EventId = Id(10000 + i) } }).ToArray());
+            j.Compact();
+        }
+        using (var j = new Journal(temp.Path))
+        {
+            Assert.False(j.RecoveredCorruption); Assert.Equal(State.Capacity, j.State.Notices.Count); Assert.Single(j.State.Coverages);
+            Assert.True(j.DiskBytes < 10 * 1024 * 1024);
+            foreach (var chunk in j.State.Notices.Values.ToArray().Chunk(100))
+                j.Commit(chunk.SelectMany(n => new Change[] {
+                    new() { Kind = "remove", Tombstone = new(n.Id!, j.State.Seq + 1, 1001, 1, new(n.EventId, n.FirstSeenAt, n.SetupHash, n.OutageId, n.EnqueuedSeq, n.CoverageId)) },
+                    new() { Kind = "retire", Key = n.EventId } }).ToArray());
+            j.Compact();
+        }
+        using var resumed = new Journal(temp.Path);
+        Assert.False(resumed.RecoveredCorruption); Assert.Empty(resumed.State.Notices); Assert.Equal(State.Capacity, resumed.State.Tombstones.Count);
+        Assert.Single(resumed.State.Coverages); Assert.True(resumed.DiskBytes < 10 * 1024 * 1024);
+        Assert.All(resumed.State.Tombstones.Values, t => Assert.Equal(proof, t.UnannouncedAdd!.CoverageId));
+    }
+
+    [Theory]
+    [InlineData("live", false, false)] [InlineData("live", false, true)] [InlineData("live", true, false)] [InlineData("live", true, true)]
+    [InlineData("recovery", false, false)] [InlineData("recovery", false, true)] [InlineData("recovery", true, false)] [InlineData("recovery", true, true)]
+    public void UncoveredCallbacksResolveMovesBeforeQualifyingAnElapsedOutage(string origin, bool scanning, bool removed)
+    {
+        using var temp = new TempDirectory(); using var j = new Journal(temp.Path); var m = new Model { ScanRunning = scanning };
+        m.Add(1, "aaaaaaaaaaaaaaaa"); m.Add(2, "aaaaaaaaaaaaaaaa"); Bound(j);
+        var e = new Engine(j, m, "key"); e.Index(m.Items[Id(1)].Title); e.BeginRecovery(Setup, 1000);
+        e.QueueAdd(Id(2), "Movie", Id(100), 1800, Setup, origin, receiptCoverage: []);
+        e.AdvanceAdds(1801, _ => { }); e.AdvanceRecovery(Setup, 1801, false);
+        Assert.False(j.State.Recoveries[Setup].HasAddition);
+        Assert.DoesNotContain(j.State.Notices.Values, n => n.Op == "summary");
+        if (removed) e.Remove(Id(1), Id(101), 1802, Setup, "recovery");
+        m.ScanRunning = false;
+        e.AdvanceAdds(2401, _ => { }); e.AdvanceRecovery(Setup, 2401, false);
+        Assert.Equal(!removed, j.State.Recoveries[Setup].HasAddition);
+        Assert.Equal(removed ? 0 : 1, j.State.Notices.Values.Count(n => n.Op == "summary"));
+        if (removed) Assert.All(j.State.Notices.Values, n => { Assert.True(n.Quiet); Assert.False(n.Folded); });
+    }
+
+    [Fact] public void CoverageBudgetRetainsConservativeWorkAndReclaimsUnreferencedProofs()
+    {
+        using var temp = new TempDirectory(); using var j = new Journal(temp.Path); var e = new Engine(j, new Model(), "key");
+        for (int i = 0; i < State.CoverageFolderCapacity / 2000; i++)
+            e.QueueAdd(Id(i + 1), "Movie", Id(10001 + i), 1000, Setup, receiptCoverage: Enumerable.Range(2000 * i + 1, 2000).Select(Id).ToArray());
+        string[] next = Enumerable.Range(State.CoverageFolderCapacity + 1, 2000).Select(Id).ToArray();
+        e.QueueAdd(Id(999), "Movie", Id(19999), 1001, Setup, receiptCoverage: next);
+        Assert.Equal("", j.State.Notices[Id(19999)].CoverageId); Assert.Equal(1, j.State.Health.Dropped);
+        var invalid = new CoverageProof(Identity.Hash(string.Concat(next)), next);
+        Assert.Throws<InvalidDataException>(() => j.State.Apply(new Change { Kind = "coverage", Coverage = invalid }));
+        Assert.Equal(State.CoverageFolderCapacity, j.State.Coverages.Values.Sum(p => p.Folders.Length));
+        j.Commit(new Change { Kind = "retire", Key = Id(10001) }, new() { Kind = "retire", Key = Id(19999) });
+        e.QueueAdd(Id(999), "Movie", Id(19999), 1002, Setup, receiptCoverage: next);
+        Assert.True(j.State.Notices.ContainsKey(Id(19999))); Assert.Equal(1, j.State.Health.Dropped); j.Compact();
+    }
+
+    [Fact] public void V5BulkReplayKeepsItsPredecessorExclusionPredicate()
+    {
+        using var temp = new TempDirectory(); string previous = Path.Combine(temp.Path, "v5"); Directory.CreateDirectory(previous);
+        string fixture = Path.Combine(AppContext.BaseDirectory, "Fixtures", "v5-bulk-quiet-pending");
+        foreach (string file in Directory.EnumerateFiles(fixture)) File.Copy(file, Path.Combine(previous, Path.GetFileName(file)));
+        File.WriteAllBytes(Path.Combine(previous, "migration.complete"), [1]);
+        using var upgraded = new Journal(temp.Path, Path.GetDirectoryName(temp.Path)!, default, TimeSpan.FromSeconds(3), versioned: true);
+        Assert.False(upgraded.RecoveredCorruption);
+        Assert.Equal(201, Assert.Single(upgraded.State.Notices.Values, n => n.Op == "rmbulk").Count);
+    }
+
+    [Theory]
+    [InlineData(false, false, false)] [InlineData(false, false, true)] [InlineData(false, true, false)] [InlineData(false, true, true)]
+    [InlineData(true, false, false)] [InlineData(true, false, true)] [InlineData(true, true, false)] [InlineData(true, true, true)]
+    public void ActualV5ObservationsMigrateToPendingWorkWithoutChangingPredecessors(bool snapshot, bool owed, bool present)
+    {
+        using var temp = new TempDirectory(); string previous = Path.Combine(temp.Path, "v5"); Directory.CreateDirectory(previous);
+        string fixture = Path.Combine(AppContext.BaseDirectory, "Fixtures", $"v5-observed-{(snapshot ? "snapshot" : "journal")}-{(owed ? "owed" : "quiet")}");
+        foreach (string file in Directory.EnumerateFiles(fixture)) File.Copy(file, Path.Combine(previous, Path.GetFileName(file)));
+        File.WriteAllBytes(Path.Combine(previous, "migration.complete"), [1]);
+        var before = Directory.EnumerateFiles(previous).ToDictionary(file => Path.GetFileName(file)!, File.ReadAllBytes);
+        var m = new Model { ReadPending = true }; m.Add(1);
+        using (var upgraded = new Journal(temp.Path, Path.GetDirectoryName(temp.Path)!, default, TimeSpan.FromSeconds(3), versioned: true))
+        {
+            Assert.False(upgraded.RecoveredCorruption); var engine = new Engine(upgraded, m, "key");
+            Assert.Equal(0, m.ReadCalls); Assert.All(upgraded.State.Notices.Values, n => Assert.Null(n.LegacyReaddObservedAt));
+            Assert.Equal(owed ? 2 : 1, upgraded.State.Notices.Values.Count(n => n.Stage == "pendingAdd")); upgraded.Compact();
+        }
+        using (var resumed = new Journal(temp.Path, Path.GetDirectoryName(temp.Path)!, default, TimeSpan.FromSeconds(3), versioned: true))
+        {
+            Assert.False(resumed.RecoveredCorruption); var engine = new Engine(resumed, m, "key");
+            if (!present) m.Items.Clear(); m.ReadPending = false;
+            engine.AdvanceAdds(1602, _ => { }); engine.AdvanceRemovals(1602, _ => { });
+            if (present)
+            {
+                Assert.DoesNotContain(resumed.State.Notices.Values, n => n.Op == "rm");
+                Assert.Equal(owed ? 1 : 0, resumed.State.Notices.Values.Count(n => Rules.Audible(n, 1602)));
+                if (owed) Assert.Equal(1000, resumed.State.Notices[Id(100)].FirstSeenAt);
+            }
+            else Assert.Equal("rm", Assert.Single(resumed.State.Notices.Values).Op);
+        }
+        foreach (var file in before) Assert.Equal(file.Value, File.ReadAllBytes(Path.Combine(previous, file.Key!)));
+    }
+
+    [Theory] [InlineData(true)] [InlineData(false)]
+    public void UnreadOriginalRetainsReceiptCoverageThroughFlapAndRestart(bool covered)
+    {
+        using var temp = new TempDirectory(); var m = new Model { ReadPending = true }; m.Add(1, folder: covered ? Id(8) : Id(9));
+        long sequence;
+        using (var j = new Journal(temp.Path))
+        {
+            var e = new Engine(j, m, "key");
+            e.QueueAdd(Id(1), "Movie", Id(100), 1000, Setup, receiptCoverage: [Id(8)]);
+            var pending = j.State.Notices[Id(100)]; sequence = pending.EnqueuedSeq;
+            Assert.Equal("live", pending.Origin); Assert.Empty(pending.Folders);
+            e.Remove(Id(1), Id(101), 1001, Setup); j.Compact();
+        }
+        using var resumed = new Journal(temp.Path); var engine = new Engine(resumed, m, "key");
+        // C has different coverage: it must not replace A's receipt proof.
+        engine.QueueAdd(Id(1), "Movie", Id(102), 1002, Setup, receiptCoverage: [Id(8), Id(9)]);
+        var original = resumed.State.Notices[Id(100)];
+        Assert.Equal(new[] { Id(8) }, resumed.State.Coverages[original.CoverageId!].Folders); Assert.Equal(1000, original.FirstSeenAt);
+        Assert.Equal(sequence, original.EnqueuedSeq); Assert.Equal(Setup, original.SetupHash);
+        m.ReadPending = false; engine.AdvanceAdds(1003, _ => { });
+        original = resumed.State.Notices[Id(100)];
+        Assert.Equal("live", original.Origin); Assert.Equal(!covered, original.Folded);
+        Assert.Equal(covered, Rules.Audible(original, 1003));
+        Assert.True(resumed.State.Notices[Id(102)].Quiet);
     }
 
     [Fact] public void MissingReaddReadReleasesItsHeldRemoval()
@@ -329,12 +492,12 @@ public sealed class ReliabilityTests
         {
             Bound(j); var e = new Engine(j, m, "key"); outage = e.BeginRecovery(Setup, 1000).Id;
             e.AdvanceRecovery(Setup, 1700, false); Assert.Empty(j.State.Notices);
-            e.QueueAdd(Id(1), "Movie", Id(100), 1800, Setup, "recovery"); e.AdvanceRecovery(Setup, 1801, false);
+            e.QueueAdd(Id(1), "Movie", Id(100), 1800, Setup, "recovery"); e.AdvanceAdds(1801, _ => { }); e.AdvanceRecovery(Setup, 1801, false);
             Assert.Single(j.State.Notices.Values, n => n.Op == "summary");
         }
         using var restored = new Journal(temp.Path); var engine = new Engine(restored, m, "key");
         Assert.Equal(outage, engine.BeginRecovery(Setup, 1802).Id);
-        engine.QueueAdd(Id(2), "Movie", Id(101), 1900, Setup, "recovery"); engine.AdvanceRecovery(Setup, 2000, true);
+        engine.QueueAdd(Id(2), "Movie", Id(101), 1900, Setup, "recovery"); engine.AdvanceAdds(2000, _ => { }); engine.AdvanceRecovery(Setup, 2000, true);
         Assert.Single(restored.State.Notices.Values, n => n.Op == "summary");
     }
 
@@ -343,9 +506,9 @@ public sealed class ReliabilityTests
         using var temp = new TempDirectory(); using var j = new Journal(temp.Path); var m = new Model();
         m.Add(1); m.Add(2); m.Add(3); Bound(j); var e = new Engine(j, m, "key");
         string old = e.BeginRecovery(Setup, 1000).Id;
-        e.QueueAdd(Id(1), "Movie", Id(100), 1001, Setup, "recovery"); e.AdvanceRecovery(Setup, 1700, false);
+        e.QueueAdd(Id(1), "Movie", Id(100), 1001, Setup, "recovery"); e.AdvanceAdds(1700, _ => { }); e.AdvanceRecovery(Setup, 1700, false);
         e.Acknowledge(j.State.Notices.Values.Where(n => n.Op == "summary").Select(n => n.EventId).ToHashSet(), 1701);
-        e.QueueAdd(Id(2), "Movie", Id(101), 1800, Setup, "recovery"); e.AdvanceRecovery(Setup, 1801, true);
+        e.QueueAdd(Id(2), "Movie", Id(101), 1800, Setup, "recovery"); e.AdvanceAdds(1801, _ => { }); e.AdvanceRecovery(Setup, 1801, true);
         e.AdvanceAdds(1802, _ => { });
         foreach (var n in j.State.Notices.Values.ToArray()) Assert.Null(e.Freshen(n, 1803));
         e.AdvanceRecovery(Setup, 1804, true); Assert.Empty(j.State.Notices); Assert.Equal(old, j.State.Recoveries[Setup].Id);
@@ -357,7 +520,7 @@ public sealed class ReliabilityTests
     [Fact] public void SummaryAudienceIsCurrentOnEveryRetryAndUnknownIsOmitted()
     {
         using var temp = new TempDirectory(); using var j = new Journal(temp.Path); var m = new Model(); m.Add(1); Bound(j);
-        var e = new Engine(j, m, "key"); e.BeginRecovery(Setup, 1000); e.QueueAdd(Id(1), "Movie", Id(100), 1001, Setup, "recovery"); e.AdvanceRecovery(Setup, 1002, true);
+        var e = new Engine(j, m, "key"); e.BeginRecovery(Setup, 1000); e.QueueAdd(Id(1), "Movie", Id(100), 1001, Setup, "recovery"); e.AdvanceAdds(1002, _ => { }); e.AdvanceRecovery(Setup, 1002, true);
         var n = Assert.Single(j.State.Notices.Values, n => n.Op == "summary"); Assert.NotEmpty(e.Freshen(n, 1003)!.Audience);
         m.Allowed = false; Assert.Empty(e.Freshen(n, 1004)!.Audience); Assert.Empty(j.State.Notices[n.EventId].Audience);
         m.Allowed = true; m.Unknown = true; Assert.Empty(e.Freshen(n, 1005)!.Audience);
@@ -369,7 +532,7 @@ public sealed class ReliabilityTests
         using var temp = new TempDirectory(); using var j = new Journal(temp.Path); var m = new Model { AsyncAudience = true }; Bound(j);
         var e = new Engine(j, m, "key"); e.BeginRecovery(Setup, 1000);
         for (int i = 1; i <= 237; i++) { m.Add(i); e.QueueAdd(Id(i), "Movie", Id(1000 + i), 1001, Setup, "recovery"); }
-        e.AdvanceRecovery(Setup, 1002, true); var n = Assert.Single(j.State.Notices.Values, n => n.Op == "summary");
+        e.AdvanceAdds(1002, _ => { }); e.AdvanceRecovery(Setup, 1002, true); var n = Assert.Single(j.State.Notices.Values, n => n.Op == "summary");
         Notice? result = null;
         for (int i = 0; i < 100 && result is null; i++)
         { try { result = e.Freshen(n, 1003 + i); } catch (LibraryPendingException) { } m.CompleteAudienceCalls(); }
@@ -439,7 +602,7 @@ public sealed class ReliabilityTests
         Assert.Single(j.State.Notices.Values, n => n.Op == "summary");
     }
 
-    [Fact] public void V5MigrationPreservesV4RollbackFilesAndLiveProvenance()
+    [Fact] public void VersionedMigrationPreservesV4RollbackFilesAndLiveProvenance()
     {
         using var temp = new TempDirectory(); string previous = Path.Combine(temp.Path, "v4"); Directory.CreateDirectory(previous);
         var m = new Model(); m.Add(1);
@@ -698,6 +861,115 @@ public sealed class ReliabilityTests
             Assert.Equal(1500, fake.Reads.Where(id => id != Id(1)).Distinct().Count());
         }
         finally { await h.Service.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(4)); }
+    }
+
+    [Fact] public async Task CoverageQuotaReaddKeepsOriginalAndRemovalHoldAndUncoversTheService()
+    {
+        using var temp = new TempDirectory(); var clock = new Clock(); using var release = new ManualResetEventSlim();
+        long now = clock.GetUtcNow().ToUnixTimeSeconds(); Seed(temp.Path, now, outbox: true);
+        string setup = Identity.Hash("fixture");
+        using (var j = new Journal(temp.Path, Path.GetDirectoryName(temp.Path)!, default, TimeSpan.FromSeconds(3), versioned: true))
+            for (int i = 0; i < State.CoverageFolderCapacity / 2000; i++)
+            {
+                string[] folders = Enumerable.Range(i * 2000 + 1, 2000).Select(Id).ToArray();
+                string proof = Identity.Hash(string.Concat(folders));
+                j.Commit(new Change { Kind = "coverage", Coverage = new(proof, folders) },
+                    new() { Kind = "remove", Tombstone = new(Id(500 + i), j.State.Seq + 1, now, 1, new(Id(10000 + i), now, setup, CoverageId: proof)) });
+            }
+        var fake = new CompatFake { Libraries = [FixtureLibrary(0)] }; fake.Add(1);
+        using (var h = new ServiceHarness(temp.Path, clock, new PluginConfiguration { Enabled = true, Secret = "fixture" }, compat: fake,
+            send: (request, _) => Task.FromResult(request.RequestUri!.Segments[^1] == "events" ? new HttpResponseMessage(HttpStatusCode.ServiceUnavailable) : ApprovalResponse(request))))
+        {
+            await h.Service.StartAsync(default);
+            try
+            {
+                await Pump(clock, () => h.Service.CoveredLibraries.Contains(Id(8)));
+                fake.BlockedId = Id(1); fake.BlockOp = "get"; fake.Block = release;
+                h.EmitRemove(fake.Items[Id(1)]); h.EmitAdd(1);
+                await Pump(clock, () => h.Service.Snapshot.DroppedTotal >= 1);
+                clock.Advance(TimeSpan.FromSeconds(601)); long barrier = clock.GetTimestamp();
+                await Pump(clock, () => h.Service.Snapshot.ProgressStamp > barrier);
+                Assert.DoesNotContain(SentEvents(h), e => e.GetProperty("op").GetString() == "rm");
+                Assert.Empty(h.Service.CoveredLibraries); Assert.NotEqual("healthy", h.Service.Health().Health);
+                await h.Service.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(4));
+            }
+            finally { release.Set(); await h.Service.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(4)); }
+        }
+        using var resumed = new Journal(temp.Path, Path.GetDirectoryName(temp.Path)!, default, TimeSpan.FromSeconds(3), versioned: true);
+        Assert.Equal("pendingAdd", resumed.State.Notices[Id(100)].Stage);
+        var pendingRemoval = Assert.Single(resumed.State.Notices.Values, n => n.Op == "rm"); Assert.Equal("pendingRemove", pendingRemoval.Stage);
+        var model = new Model(); model.Add(1); var engine = new Engine(resumed, model, "key");
+        engine.AdvanceAdds(clock.GetUtcNow().ToUnixTimeSeconds(), _ => { });
+        Assert.True(Rules.Audible(resumed.State.Notices[Id(100)], clock.GetUtcNow().ToUnixTimeSeconds()));
+        Assert.DoesNotContain(resumed.State.Notices.Values, n => n.Op == "rm");
+        Assert.Single(resumed.State.Notices.Values, n => n.Op == "add" && n.Quiet);
+    }
+
+    [Theory] [InlineData(false)] [InlineData(true)]
+    public async Task FirstReadFlapPreservesExactlyOneOriginalAlert(bool restartMidRead)
+    {
+        using var temp = new TempDirectory(); var clock = new Clock(); using var release = new ManualResetEventSlim();
+        Seed(temp.Path, clock.GetUtcNow().ToUnixTimeSeconds());
+        var config = new PluginConfiguration { Enabled = true, Secret = "fixture" };
+        var fake = new CompatFake { Libraries = [FixtureLibrary(0)] }; fake.Add(1);
+        string? originalId = null; long receivedAt = 0;
+        using (var h = new ServiceHarness(temp.Path, clock, config, compat: fake))
+        {
+            await h.Service.StartAsync(default);
+            try
+            {
+                await Pump(clock, () => h.Service.CoveredLibraries.Contains(Id(8)));
+                fake.Add(2); fake.BlockedId = Id(2); fake.BlockOp = "get"; fake.Block = release;
+                receivedAt = clock.GetUtcNow().ToUnixTimeSeconds(); h.EmitAdd(2);
+                await Pump(clock, () => fake.Entered != 0);
+                if (restartMidRead)
+                {
+                    // Stop while the metadata call is still pending: only journaled work survives.
+                    await h.Service.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(4));
+                    using var saved = new Journal(temp.Path, Path.GetDirectoryName(temp.Path)!, default, TimeSpan.FromSeconds(3), versioned: true);
+                    var pending = Assert.Single(saved.State.Notices.Values, n => n.Id == Id(2));
+                    Assert.Equal("pendingAdd", pending.Stage); Assert.Equal("live", pending.Origin);
+                    Assert.Equal(receivedAt, pending.FirstSeenAt); originalId = pending.EventId;
+                }
+                else
+                {
+                    clock.Advance(TimeSpan.FromSeconds(1)); h.EmitRemove(fake.Items[Id(2)]); h.EmitAdd(2);
+                    long barrier = clock.GetTimestamp();
+                    await Pump(clock, () => h.Service.Snapshot.ProgressStamp > barrier);
+                    fake.BlockOp = null; release.Set();
+                    await Pump(clock, () => SentEvents(h).Count(e => e.GetProperty("op").GetString() == "add") >= 2);
+                    AssertOriginalAndRepair(SentEvents(h), receivedAt, null);
+                }
+            }
+            finally { release.Set(); await h.Service.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(4)); }
+        }
+        if (!restartMidRead) return;
+        release.Reset();
+        using var resumed = new ServiceHarness(temp.Path, clock, config, compat: fake);
+        await resumed.Service.StartAsync(default);
+        // Queue the rest of the flap before the restarted loop can resolve metadata.
+        try
+        {
+            await Pump(clock, () => fake.Entered >= 2);
+            resumed.EmitRemove(fake.Items[Id(2)]); resumed.EmitAdd(2);
+            long barrier = clock.GetTimestamp();
+            await Pump(clock, () => resumed.Service.Snapshot.ProgressStamp > barrier);
+            fake.BlockOp = null; release.Set();
+            await Pump(clock, () => SentEvents(resumed).Count(e => e.GetProperty("op").GetString() == "add") >= 2);
+            AssertOriginalAndRepair(SentEvents(resumed), receivedAt, originalId);
+        }
+        finally { release.Set(); await resumed.Service.StopAsync(default).WaitAsync(TimeSpan.FromSeconds(4)); }
+    }
+
+    private static void AssertOriginalAndRepair(IEnumerable<JsonElement> events, long receivedAt, string? originalId)
+    {
+        var adds = events.Where(e => e.GetProperty("op").GetString() == "add").ToArray();
+        var original = Assert.Single(adds, e => !e.TryGetProperty("quiet", out var quiet) || !quiet.GetBoolean());
+        Assert.Equal("live", original.GetProperty("origin").GetString());
+        Assert.Equal(receivedAt, original.GetProperty("firstSeenAt").GetInt64());
+        if (originalId is not null) Assert.Equal(originalId, original.GetProperty("e").GetString());
+        Assert.Single(adds, e => e.TryGetProperty("quiet", out var quiet) && quiet.GetBoolean());
+        Assert.DoesNotContain(events, e => e.GetProperty("op").GetString() == "summary");
     }
 
     [Fact] public async Task StartupScanCallbacksAreRecoveryEvenWhenProcessedAfterCoverageReturns()
@@ -1030,7 +1302,7 @@ public sealed class ReliabilityTests
     [Fact] public void CachedSummaryEntitlementKeepsItsActualEvaluationTimestampOnTheWire()
     {
         using var temp = new TempDirectory(); using var j = new Journal(temp.Path); var m = new Model { SampleAt = 1001 }; m.Add(1); Bound(j);
-        var e = new Engine(j, m, "key"); e.BeginRecovery(Setup, 1000); e.QueueAdd(Id(1), "Movie", Id(100), 1001, Setup, "recovery"); e.AdvanceRecovery(Setup, 1002, true);
+        var e = new Engine(j, m, "key"); e.BeginRecovery(Setup, 1000); e.QueueAdd(Id(1), "Movie", Id(100), 1001, Setup, "recovery"); e.AdvanceAdds(1002, _ => { }); e.AdvanceRecovery(Setup, 1002, true);
         var summary = Assert.Single(j.State.Notices.Values, n => n.Op == "summary");
         Assert.Equal(1001, e.Freshen(summary, 1100)!.At);
         var expired = e.Freshen(summary, 2302)!; Assert.Empty(expired.Audience); Assert.Equal(2302, expired.At);

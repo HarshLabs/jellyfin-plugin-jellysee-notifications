@@ -100,11 +100,23 @@ and HResult only. A successful complete iteration resets retry backoff. One
 supervisor-owned monotonic limiter caps all heartbeat attempts at twelve/hour
 and honors relay backoff across worker sessions.
 
-Production writes state below `v5/` using the existing binary container and JSON
-records for optional add obligations. Import prefers a completed `v4/`, preserving
-its provenance, and otherwise imports legacy files as recovery. Both source
-directories remain unchanged for downgrade. The migration marker is
-published only after a complete imported snapshot. See the reliability plan's
+Production writes state below `v6/` using the existing binary container and JSON
+records for optional add obligations and shared receipt coverage proofs. Import
+prefers a completed `v5/`, then `v4/`, preserving provenance, and otherwise imports
+legacy files as recovery. All source directories remain unchanged for downgrade.
+The migration marker is published only after a complete imported snapshot. Legacy
+re-add observations are decoded for replay and converted to pending additions
+before the engine performs metadata reads; new callbacks never write observations.
+
+Coverage proofs are shared by content hash across pending notices and tombstone
+obligations. At most 5,000 proofs and 64,000 total folder IDs can be retained.
+Before admitting a new proof, unreferenced proofs are reclaimed; if the budget
+remains full, the callback is still admitted with an empty conservative proof;
+the lost authority increments the dropped counter and triggers coverage invalidation
+and reconciliation. Existing originals and re-add removal holds remain durable.
+Metadata evaluation resolves moves before folding uncovered originals into recovery,
+while keeping receipt provenance immutable. Predecessor bulk journals replay their
+original exclusion predicate during import; v6 uses the unified pending-work rule. See the reliability plan's
 Decisions for the downgrade/re-upgrade workflow.
 
 All readers use `FileAccess.Read` and `FileShare.Read | FileShare.Delete`;

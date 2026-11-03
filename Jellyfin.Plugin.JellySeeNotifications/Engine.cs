@@ -10,7 +10,7 @@ public sealed class Engine
     private readonly INotificationLibrary source;
     private readonly string serverKey;
     public Engine(Journal journal, IJellyfinCompat compat, string serverKey) : this(journal, new DirectLibrary(compat, serverKey), serverKey) { }
-    internal Engine(Journal journal, INotificationLibrary source, string serverKey) { this.journal = journal; this.source = source; this.serverKey = serverKey; }
+    internal Engine(Journal journal, INotificationLibrary source, string serverKey) { this.journal = journal; this.source = source; this.serverKey = serverKey; ImportLegacyReadds(); }
     internal Func<bool> BudgetAvailable { get; set; } = () => true;
     internal bool WorkPending { get; private set; }
     internal void ResetPendingWork() => WorkPending = false;
@@ -78,21 +78,46 @@ public sealed class Engine
         changes.Add(new() { Kind = "notice", Notice = hint with { EnqueuedSeq = State.Seq + 1 } });
         journal.Commit(changes.ToArray());
     }
+    private void ImportLegacyReadds()
+    {
+        foreach (var removal in State.Notices.Values.Where(n => n.LegacyReaddObservedAt is not null).ToArray())
+        {
+            long at = removal.LegacyReaddObservedAt!.Value;
+            // Old markers had no receipt coverage. Only a carried original has proven live eligibility.
+            QueueAdd(removal.Id!, removal.Type!, Identity.Hash(removal.EventId + ":readd:" + at)[..32], at, removal.SetupHash, "recovery");
+            if (State.Notices.TryGetValue(removal.EventId, out var retained)) Put(retained with { LegacyReaddObservedAt = null });
+        }
+    }
+    private bool AdmitCoverage(string[]? folders, out string? id)
+    {
+        id = folders is null ? null : folders.Length == 0 ? "" : Identity.Hash(string.Concat(folders.Distinct().Order(StringComparer.Ordinal)));
+        if (string.IsNullOrEmpty(id) || State.Coverages.ContainsKey(id)) return true;
+        var proof = new CoverageProof(id, folders!.Distinct().Order(StringComparer.Ordinal).ToArray());
+        if (State.Coverages.Count >= State.Capacity || State.Coverages.Values.Sum(p => p.Folders.Length) + proof.Folders.Length > State.CoverageFolderCapacity)
+        {
+            var used = State.Notices.Values.Select(n => n.CoverageId).Concat(State.Tombstones.Values.Select(t => t.UnannouncedAdd?.CoverageId)).ToHashSet(StringComparer.Ordinal);
+            foreach (var chunk in State.Coverages.Keys.Where(k => !used.Contains(k)).ToArray().Chunk(200))
+                journal.Commit(chunk.Select(k => new Change { Kind = "uncoverage", Key = k }).ToArray());
+        }
+        if (State.Coverages.Count >= State.Capacity || State.Coverages.Values.Sum(p => p.Folders.Length) + proof.Folders.Length > State.CoverageFolderCapacity)
+        {
+            // Empty proof means no live authority. Work and same-ID holds still reach the journal.
+            id = "";
+            journal.Commit(new Change { Kind = "health", Health = State.Health with { Dropped = State.Health.Dropped + 1 } }); return false;
+        }
+        journal.Commit(new Change { Kind = "coverage", Coverage = proof }); return true;
+    }
     public int Life(string id) => Math.Max(State.Lifecycles.GetValueOrDefault(id), State.Index.TryGetValue(id, out var title) ? title.Life : 0);
-    internal void ObserveReadd(string id, long at, string setup)
+    internal Notice? HeldRemoval(string id, string setup)
     {
-        foreach (var removal in State.Notices.Values.Where(n => n.Op == "rm" && n.Stage == "pendingRemove" && n.Id == id && n.SetupHash == setup && n.ReaddObservedAt is null && at >= n.FirstSeenAt && at - n.FirstSeenAt < Rules.MoveWindow).ToArray())
-            Put(removal with { ReaddObservedAt = at });
+        var pending = Rules.PendingReadds(State.Notices.Values, State.Index);
+        return State.Notices.Values.FirstOrDefault(n => n.Op == "rm" && n.Id == id && n.SetupHash == setup && Rules.AwaitingReadd(n, pending));
     }
-    internal void ReleaseObservedReadd(string id, long at, string setup)
+    // False requests reconciliation after receipt authority was reduced. Work is already durable.
+    public bool QueueAdd(string id, string type, string eventId, long now, string setup, string origin = "live", bool folded = false, string[]? receiptCoverage = null)
     {
-        foreach (var removal in State.Notices.Values.Where(n => n.Op == "rm" && n.Id == id && n.SetupHash == setup && n.ReaddObservedAt is { } observed && observed <= at).ToArray())
-            Put(removal with { ReaddObservedAt = null });
-    }
-    public void QueueAdd(string id, string type, string eventId, long now, string setup, string origin = "live", bool folded = false)
-    {
-        if (State.Notices.Values.Any(n => n.Op == "add" && n.Id == id && n.Life == Life(id))) return;
-        ObserveReadd(id, now, setup);
+        if (State.Notices.Values.Any(n => n.Op == "add" && n.Id == id && n.Life == Life(id))) return true;
+        bool authorityRetained = AdmitCoverage(receiptCoverage, out string? coverageId);
         // Jellyfin IDs derive from type + path. A same-ID callback is the same file,
         // even if scan churn changed the provider metadata or advanced its lifecycle.
         State.Tombstones.TryGetValue(id, out var tomb);
@@ -102,26 +127,13 @@ public sealed class Engine
         // Preserve the original, still-unacknowledged live add; this is its retry, not a new
         // re-add announcement. Keeping e also lets the relay deduplicate a lost acknowledgement.
         var owed = !indexed && tomb is not null && now - tomb.At < 86400 && tomb.UnannouncedAdd?.SetupHash == setup ? tomb.UnannouncedAdd : null;
-        var notice = new Notice { EventId = owed?.EventId ?? eventId, Id = id, Type = type, QueuedAt = now, Life = Life(id), SetupHash = setup, Origin = owed is null ? origin : "live", FirstSeenAt = owed?.FirstSeenAt ?? now, Quiet = folded || owed is null && readd, Folded = folded && (owed is not null || !readd), OutageId = owed?.OutageId, EnqueuedSeq = owed?.EnqueuedSeq ?? 0 };
+        var notice = new Notice { EventId = owed?.EventId ?? eventId, Id = id, Type = type, QueuedAt = now, Life = Life(id), SetupHash = setup, Origin = owed is null ? origin : "live", FirstSeenAt = owed?.FirstSeenAt ?? now, Quiet = folded || owed is null && readd, Folded = folded && (owed is not null || !readd), OutageId = owed?.OutageId, EnqueuedSeq = owed?.EnqueuedSeq ?? 0, CoverageId = owed is null ? coverageId : owed.CoverageId };
         if (owed is null) Put(notice);
         else
             // Always repair membership separately: callback receipt time cannot prove whether
             // a removal drained while its metadata read was pending. The original retry stays idempotent.
-            PutRestoredAdd(notice, notice with { EventId = eventId == notice.EventId ? Identity.EventId() : eventId, Life = Life(id), Origin = origin, FirstSeenAt = now, Quiet = true, Folded = false, OutageId = null });
-        if (!readd && (origin == "recovery" || folded))
-        {
-            try
-            {
-                if (source.Read(id, now, now) is { } item && !PotentialMove(notice, item.Title)) RecoverAddition(notice, now);
-            }
-            catch (Exception ex) when (ex is not (StatePersistenceException or OutOfMemoryException or OperationCanceledException)) { /* AdvanceAdds retries unknown metadata. */ }
-        }
-    }
-    private bool PotentialMove(Notice notice, Title title)
-    {
-        if (string.IsNullOrEmpty(title.ProviderDigest)) return false;
-        var addition = new Addition(notice.Id!, title.Type, title.Folders, title.ProviderDigest, notice.FirstSeenAt, notice.SetupHash);
-        return State.Index.Values.Any(t => t.Id != notice.Id && t.Type == title.Type && t.ProviderDigest == title.ProviderDigest) || State.Notices.Values.Any(n => n.Op == "rm" && Rules.Upgrade(n, addition));
+            PutRestoredAdd(notice, notice with { EventId = eventId == notice.EventId ? Identity.EventId() : eventId, Life = Life(id), Origin = origin, FirstSeenAt = now, Quiet = true, Folded = false, OutageId = null, CoverageId = coverageId });
+        return authorityRetained;
     }
     public void Index(BaseItem item, long passSeq = long.MaxValue) => IndexMany([item], passSeq);
     public void IndexMany(IEnumerable<BaseItem> items, long passSeq, Action<string>? error = null)
@@ -155,7 +167,7 @@ public sealed class Engine
     {
         // Duplicate descendant/root-reconcile removals do not advance a lifecycle twice.
         bool indexed = State.Index.TryGetValue(id, out var title);
-        var observed = State.Notices.Values.FirstOrDefault(n => n.Op == "rm" && n.Id == id && n.SetupHash == setup && n.ReaddObservedAt is not null);
+        var observed = HeldRemoval(id, setup);
         if (title is null && State.Tombstones.ContainsKey(id) && observed is null && !State.Notices.Values.Any(n => n.Id == id && n.Op == "add" && n.Life == Life(id))) return;
         // A final delete can supersede a re-add whose first metadata read never completed.
         if (title is null && observed is not null) title = new(id, observed.Type!, observed.Folders, observed.ProviderDigest, State.Seq, Life(id));
@@ -163,7 +175,7 @@ public sealed class Engine
         if (State.Tombstones.Count >= State.IndexCapacity && !State.Tombstones.ContainsKey(id))
             journal.Commit(new Change() { Kind = "untombstone", Key = State.Tombstones.Values.MinBy(t => t.At)!.Id });
         var original = State.Notices.Values.FirstOrDefault(n => n.Id == id && n.Op == "add" && n.SetupHash == setup && n.Origin == "live" && !n.Quiet && !n.Folded);
-        var obligation = original is not null ? new AddObligation(original.EventId, original.FirstSeenAt, original.SetupHash, original.OutageId, original.EnqueuedSeq) :
+        var obligation = original is not null ? new AddObligation(original.EventId, original.FirstSeenAt, original.SetupHash, original.OutageId, original.EnqueuedSeq, original.CoverageId) :
             !indexed && State.Tombstones.TryGetValue(id, out var previous) && now - previous.At < 86400 && previous.UnannouncedAdd?.SetupHash == setup ? previous.UnannouncedAdd : null;
         var tomb = new Tombstone(id, State.Seq + 1, now, life, obligation);
         Notice? removal = title is null ? null : new()
@@ -175,7 +187,8 @@ public sealed class Engine
             Drop(Oldest(false).EventId);
         List<Change> changes = [new() { Kind = "remove", Tombstone = tomb }];
         if (removal is not null) changes.Add(new() { Kind = "notice", Notice = removal });
-        foreach (var prior in State.Notices.Values.Where(n => n.Id == id && n.Op == "rm" && n.SetupHash == setup && n.ReaddObservedAt is not null).ToArray())
+        var pendingReadds = Rules.PendingReadds(State.Notices.Values, State.Index);
+        foreach (var prior in State.Notices.Values.Where(n => n.Id == id && n.Op == "rm" && n.SetupHash == setup && Rules.AwaitingReadd(n, pendingReadds)).ToArray())
         { CancelNotice(prior.EventId); changes.Add(new() { Kind = "retire", Key = prior.EventId }); }
         foreach (var pending in State.Notices.Values.Where(n => n.Id == id && n.Op == "add" && n.Life < life).ToArray())
         { CancelNotice(pending.EventId); changes.Add(new() { Kind = "retire", Key = pending.EventId }); }
@@ -191,11 +204,11 @@ public sealed class Engine
             try
             {
                 var item = source.Read(n.Id!, n.FirstSeenAt, now);
-                if (item is null) { Retire(n.EventId); ReleaseObservedReadd(n.Id!, n.QueuedAt, n.SetupHash); continue; }
+                if (item is null) { Retire(n.EventId); continue; }
                 // Fingerprint a discovered replacement before readiness can delay it.
                 var description = item.Title;
                 if (n.ProviderDigest != description.ProviderDigest || !n.Folders.SequenceEqual(description.Folders))
-                    Put(n with { ProviderDigest = description.ProviderDigest, Folders = description.Folders });
+                { n = n with { ProviderDigest = description.ProviderDigest, Folders = description.Folders }; Put(n); }
                 if (!State.Additions.ContainsKey(n.Id!) && State.Additions.Count >= State.Capacity)
                     journal.Commit(new Change() { Kind = "unaddition", Key = State.Additions.Values.MinBy(a => a.At)!.Id });
                 // Discovery time is the occurrence time, even when metadata took minutes.
@@ -223,6 +236,11 @@ public sealed class Engine
                 if (!n.Folded && !quiet && duplicate && n.HoldUntil == 0)
                 { Put(n with { HoldUntil = n.FirstSeenAt + 1800, HoldForScan = source.ScanRunning }); continue; }
                 if (!n.Folded && !quiet && duplicate && (n.HoldForScan ? source.ScanRunning && now < n.HoldUntil : now < n.FirstSeenAt + Rules.MoveWindow)) continue;
+                // Coverage can reduce receipt authority only after a possible move resolves.
+                // Preserve origin/time; fold an uncovered live original into ordinary recovery.
+                bool uncovered = n.CoverageId is { } proof && (description.Folders.Length == 0 || (proof.Length == 0 || !description.Folders.All(State.Coverages[proof].Folders.Contains)));
+                if (uncovered && n.Origin == "live" && !quiet && !n.Folded)
+                { n = n with { Quiet = true, Folded = true }; Put(n); quiet = true; }
                 if ((!quiet || n.Folded) && !Rules.Audible(n, now))
                 { RecoverAddition(n, now); n = State.Notices[n.EventId]; }
                 // A proven same-file re-add needs no new-title metadata delay. Index it and
@@ -238,7 +256,7 @@ public sealed class Engine
                     {
                         var departed = held.Folders.Except(description.Folders).ToArray();
                         if (departed.Length == 0) Retire(held.EventId);
-                        else Put(held with { Folders = departed, Quiet = true, ReaddObservedAt = null });
+                        else Put(held with { Folders = departed, Quiet = true });
                     }
                 var audience = source.Audience(n.Id, description.Folders, now);
                 if (audience.Length == 0)
@@ -256,29 +274,8 @@ public sealed class Engine
     }
     public void AdvanceRemovals(long now, Action<string> error)
     {
-        // A re-add observed during the hold cancels removal presentation even if its
-        // asynchronous metadata read is still pending. Keep the metadata for a final delete.
-        // Callback receipt can precede its first metadata read. Resume that durable work after
-        // restart instead of retaining a hold whose in-memory signal no longer exists.
-        var queuedReadds = Rules.PendingReadds(State.Notices.Values);
-        foreach (var orphan in State.Notices.Values.Where(n => n.Op == "rm" && n.Stage == "pendingRemove" && n.ReaddObservedAt is not null && !queuedReadds[(n.Id, n.SetupHash)].Any()).ToArray())
-        {
-            if (!BudgetAvailable()) { WorkPending = true; return; }
-            try
-            {
-                var item = source.Read(orphan.Id!, orphan.ReaddObservedAt!.Value, now);
-                if (item is null) ReleaseObservedReadd(orphan.Id!, orphan.ReaddObservedAt.Value, orphan.SetupHash);
-                else
-                {
-                    QueueAdd(orphan.Id!, item.Title.Type, Identity.EventId(), orphan.ReaddObservedAt.Value, orphan.SetupHash, "recovery");
-                    AdvanceAdds(now, error, orphan.Id);
-                }
-            }
-            catch (LibraryPendingException) { WorkPending = true; }
-            catch (LibraryCallException) { error("requiredCallTimeout"); }
-            catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException or StatePersistenceException)) { error("itemEvaluationFailed"); }
-        }
-        var readdHolds = Rules.PendingReadds(State.Notices.Values);
+        // Durable pending adds hold only their own removal while metadata resolves.
+        var readdHolds = Rules.PendingReadds(State.Notices.Values, State.Index);
         bool AwaitingReadd(Notice removal) => Rules.AwaitingReadd(removal, readdHolds);
         var pending = State.Notices.Values.Where(n => n.Stage == "pendingRemove" && !AwaitingReadd(n)).OrderBy(n => n.QueuedAt).ToArray();
         // Pending fingerprints also survive history eviction while readiness is

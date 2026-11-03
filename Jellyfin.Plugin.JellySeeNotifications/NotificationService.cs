@@ -320,7 +320,6 @@ public sealed class NotificationService : BackgroundService
         int emptyPolls = 0;
         bool readyRequested = false, inventoryComplete = false;
         HashSet<string> updated = new(StringComparer.Ordinal);
-        HashSet<string> evaluatingAdds = new(StringComparer.Ordinal);
         bool Due(long? at, double seconds) => at is null || timeProvider.GetElapsedTime(at.Value).TotalSeconds >= seconds;
         await IterationLoop.Run(async () =>
         {
@@ -394,19 +393,18 @@ public sealed class NotificationService : BackgroundService
                     if (signal.Op == "add")
                     {
                         if (journal.State.Notices.Values.Any(n => n.Op == "add" && n.Id == signal.Id && n.Life == engine.Life(signal.Id))) continue;
-                        engine.ObserveReadd(signal.Id, signal.At, signal.Setup);
-                        if (evaluatingAdds.Add(signal.Id)) lanes.Invalidate(signal.Id);
-                        var item = lanes.Read(signal.Id, signal.At, now);
-                        if (item is null) { engine.ReleaseObservedReadd(signal.Id, signal.At, signal.Setup); continue; }
-                        if (item.Title.Folders.Length == 0 || !item.Title.Folders.All(signal.Coverage.Contains)) origin = "recovery";
-                        engine.QueueAdd(signal.Id, signal.Type!, signal.EventId, signal.At, signal.Setup, origin, signal.ClockEpoch != Interlocked.Read(ref clockEpoch));
-                        scan?.Known.Add(signal.Id); queuedAt = Mono; readyRequested = true;
+                        // Admit before any metadata call. AdvanceAdds owns evaluation and replay.
+                        lanes.Invalidate(signal.Id);
+                        if (!engine.QueueAdd(signal.Id, signal.Type!, signal.EventId, signal.At, signal.Setup, origin,
+                            signal.ClockEpoch != Interlocked.Read(ref clockEpoch), signal.Coverage.Order(StringComparer.Ordinal).ToArray()))
+                        { Uncover("channelDropped"); reconcileAt = null; scan = null; }
+                        else scan?.Known.Add(signal.Id);
+                        queuedAt = Mono; readyRequested = true;
                     }
                     else if (signal.Op == "rm")
                     {
-                        removedThrough[signal.Id] = signal.Sequence; lanes.Invalidate(signal.Id); updated.Remove(signal.Id); evaluatingAdds.Remove(signal.Id);
-                        var removedFolders = journal.State.Index.TryGetValue(signal.Id, out var title) ? title.Folders : journal.State.Notices.Values
-                            .FirstOrDefault(n => n.Op == "rm" && n.Id == signal.Id && n.SetupHash == signal.Setup && n.ReaddObservedAt is not null)?.Folders;
+                        removedThrough[signal.Id] = signal.Sequence; lanes.Invalidate(signal.Id); updated.Remove(signal.Id);
+                        var removedFolders = journal.State.Index.TryGetValue(signal.Id, out var title) ? title.Folders : engine.HeldRemoval(signal.Id, signal.Setup)?.Folders;
                         if (removedFolders is null || removedFolders.Length == 0 || !removedFolders.All(signal.Coverage.Contains)) origin = "recovery";
                         engine.Remove(signal.Id, signal.EventId, signal.At, signal.Setup, origin, signal.ClockEpoch != Interlocked.Read(ref clockEpoch)); scan?.Known.Remove(signal.Id); queuedAt = Mono;
                     }
@@ -421,7 +419,7 @@ public sealed class NotificationService : BackgroundService
                 }
                 catch (LibraryPendingException) { pendingSignals.Enqueue(signal); retry = true; }
                 catch (LibraryCallException) { Uncover("requiredCallTimeout"); pendingSignals.Enqueue(signal); retry = true; }
-                finally { if (!retry) { CompleteSignal(signal); if (signal.Op == "add") evaluatingAdds.Remove(signal.Id); } }
+                finally { if (!retry) CompleteSignal(signal); }
             }
             var pendingIds = pendingSignals.Select(s => s.Id).ToHashSet(StringComparer.Ordinal);
             foreach (string id in removedThrough.Keys.Where(id => !pendingIds.Contains(id)).ToArray()) removedThrough.Remove(id);
