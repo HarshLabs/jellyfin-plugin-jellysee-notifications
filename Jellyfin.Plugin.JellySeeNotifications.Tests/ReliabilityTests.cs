@@ -683,6 +683,8 @@ public sealed class ReliabilityTests
         ring.Record("private-path-title-secret"); for (int i = 0; i < 5000; i++) ring.Record(i % 2 == 0 ? "restartRequired" : "stateRecovered");
         Assert.Equal(1024, ring.Read().Length); Assert.All(ring.Read(), e => Assert.Contains(e.Cause, CauseCodes.Allowed));
         string path = Path.Combine(temp.Path, "diagnostics", "diagnostics.ndjson"); await Until(() => File.Exists(path) && new FileInfo(path).Length > 0);
+        // The writer rewrites asynchronously; Windows forbids reading while it holds the file.
+        ring.Dispose(); await ring.Completion.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.InRange(new FileInfo(path).Length, 1, DiagnosticsRing.MaxBytes);
         Assert.DoesNotContain("private-path-title-secret", File.ReadAllText(path));
         using var failing = new DiagnosticsRing(() => throw new IOException("secret"), TimeProvider.System); failing.Record("stateUnavailable"); Assert.Single(failing.Read());
