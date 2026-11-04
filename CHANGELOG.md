@@ -19,5 +19,7 @@
 - Add authenticated session-derived recipient bindings and minimal runtime
   health proof, plus elevated runtime diagnostics with a bounded, redacted ring.
   Runtime status is no longer written into saved configuration.
+- Keep items Jellyfin announces again during a rescan quiet: an item already
+  in the library, or removed and restored at the same path, no longer alerts.
 - Migrate into versioned state while retaining original files for downgrade.
-- Jellyfin 10.11 uses 1.1.0.0; Jellyfin 12 uses 1.1.0.1. No manifest publication.
+- Jellyfin 10.11 uses 1.1.0.0; Jellyfin 12 uses 1.1.0.1.
