@@ -2,16 +2,22 @@
 
 ## 1.1.1.0
 
-- Disable older installed copies of the plugin on start. Jellyfin leaves a
-  version folder it couldn't delete (a DLL locked on Windows during an
-  in-process restart) marked Deleted, and a dashboard catalog refresh rewrites
-  that back to Active. A later cold start could then load the stale version,
-  which sent a bogus removal summary from its pre-upgrade snapshot. Disabled
-  survives catalog refreshes, and Jellyfin deletes the folder on the next
-  cold start.
+- Never let an older copy of the plugin take over again. On Windows, Jellyfin
+  could not fully delete the previous version during an update restart, because
+  its DLL stayed locked; only the DLL was left. On a later restart Jellyfin
+  gave that leftover a generated plugin id that sorted ahead of the real one,
+  deleted the new version as if it were older, and loaded the old one, which
+  then sent a false "titles were removed" alert. The plugin now repairs every
+  leftover older copy at each start: it marks the copy Disabled under the real
+  id, so the newer version always wins, then removes it, or leaves it for
+  Jellyfin to delete on the next restart if it is still locked. No admin
+  action is needed.
+- One-time cleanup only if a leftover already exists before updating (a
+  `JellySee Notifications_<older version>` folder in the plugins directory
+  holding only a DLL): stop Jellyfin, delete that folder, then update.
 - Refuse to open notification state when a newer release has completed its
-  migration into a later schema, so a revived older copy never diffs outdated
-  state. Every future schema keeps this check.
+  migration into a later schema, so a revived older copy never compares
+  outdated state. Every future schema keeps this check.
 - Jellyfin 10.11 uses 1.1.1.0; Jellyfin 12 uses 1.1.1.1.
 
 ## 1.1.0.0

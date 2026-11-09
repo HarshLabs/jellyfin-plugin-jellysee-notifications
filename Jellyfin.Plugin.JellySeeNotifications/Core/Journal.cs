@@ -76,6 +76,7 @@ public sealed class Journal : IDisposable
     // changed since the upgrade. Refuse to open instead: no state, no alerts,
     // and the supervisor reports stateUnavailable until the newer version runs.
     // Every future schema keeps this check against versions above its own.
+    // An empty marker is an unfinished migration (same rule as v6 below), not proof.
     private static void RefuseNewerSchema(string root)
     {
         if (!Directory.Exists(root)) return;
@@ -83,7 +84,7 @@ public sealed class Journal : IDisposable
         {
             string name = Path.GetFileName(entry);
             if (name.Length > 1 && name.Length <= 6 && name[1..].All(char.IsAsciiDigit) && int.Parse(name[1..], System.Globalization.CultureInfo.InvariantCulture) > SchemaVersion
-                && File.Exists(Path.Combine(entry, "migration.complete")))
+                && new FileInfo(Path.Combine(entry, "migration.complete")) is { Exists: true, Length: > 0 })
                 throw new NewerStateException();
         }
     }
