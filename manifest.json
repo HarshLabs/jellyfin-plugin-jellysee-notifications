@@ -8,6 +8,22 @@
         "category": "Notifications",
         "versions": [
             {
+                "version": "1.1.1.1",
+                "changelog": "JellySee Notifications 1.1.1: fixes an older plugin version taking over after an update and sending a false \"titles were removed\" alert (seen on Windows servers). The plugin now cleans up leftover older copies of itself at every start, so the new version always stays in charge. No action needed. Only if a JellySee Notifications_<older version> folder holding just a DLL already exists in your plugins folder: stop Jellyfin, delete that folder, then update.\n",
+                "targetAbi": "12.0.0.0",
+                "sourceUrl": "https://github.com/HarshLabs/jellyfin-plugin-jellysee-notifications/releases/download/v1.1.1.0/jellysee-notifications_1.1.1.0_jf12.zip",
+                "checksum": "cd181e65377c1092bf57800f435b9599",
+                "timestamp": "2026-11-09T05:59:10Z"
+            },
+            {
+                "version": "1.1.1.0",
+                "changelog": "JellySee Notifications 1.1.1: fixes an older plugin version taking over after an update and sending a false \"titles were removed\" alert (seen on Windows servers). The plugin now cleans up leftover older copies of itself at every start, so the new version always stays in charge. No action needed. Only if a JellySee Notifications_<older version> folder holding just a DLL already exists in your plugins folder: stop Jellyfin, delete that folder, then update.\n",
+                "targetAbi": "10.11.0.0",
+                "sourceUrl": "https://github.com/HarshLabs/jellyfin-plugin-jellysee-notifications/releases/download/v1.1.1.0/jellysee-notifications_1.1.1.0_jf10.11.zip",
+                "checksum": "9243b1e517d6350955c5cde949a69eb2",
+                "timestamp": "2026-11-09T05:59:10Z"
+            },
+            {
                 "version": "1.1.0.1",
                 "changelog": "JellySee Notifications 1.1: new-item alerts go out about a second after Jellyfin finishes an item (no more minute-long wait); items Jellyfin re-announces during a rescan, renames and moves stay quiet; the plugin restarts itself after failures, sends one summary after an outage and warns admins when it stays down.\n",
                 "targetAbi": "12.0.0.0",
