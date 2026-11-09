@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.1.1.0
+
+- Disable older installed copies of the plugin on start. Jellyfin leaves a
+  version folder it couldn't delete (a DLL locked on Windows during an
+  in-process restart) marked Deleted, and a dashboard catalog refresh rewrites
+  that back to Active. A later cold start could then load the stale version,
+  which sent a bogus removal summary from its pre-upgrade snapshot. Disabled
+  survives catalog refreshes, and Jellyfin deletes the folder on the next
+  cold start.
+- Refuse to open notification state when a newer release has completed its
+  migration into a later schema, so a revived older copy never diffs outdated
+  state. Every future schema keeps this check.
+- Jellyfin 10.11 uses 1.1.1.0; Jellyfin 12 uses 1.1.1.1.
+
 ## 1.1.0.0
 
 - Supervise every state failure, reopening only after the previous writer and

@@ -38,6 +38,7 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
 {
     public void RegisterServices(IServiceCollection services, IServerApplicationHost applicationHost)
     {
+        services.AddHostedService<VersionHygiene>();
         services.AddSingleton<IJellyfinCompat, JellyfinCompat>();
         services.AddSingleton<RelayClient>();
         services.AddSingleton<NotificationService>();

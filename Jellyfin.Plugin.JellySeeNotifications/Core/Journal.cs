@@ -42,7 +42,7 @@ public sealed class Journal : IDisposable
             io.Invoke(() =>
             {
                 string original = directory;
-                if (versioned) directory = Path.Combine(directory, "v6");
+                if (versioned) { RefuseNewerSchema(original); directory = Path.Combine(directory, "v" + SchemaVersion); }
                 files = new StateDirectory(directory, pluginDataPath ?? Path.GetDirectoryName(Path.GetFullPath(directory))!, io.Token);
                 if (versioned && files.Length("migration.complete") == 0)
                 {
@@ -67,6 +67,24 @@ public sealed class Journal : IDisposable
             ct.ThrowIfCancellationRequested();
             // A new worker is safe only once the old worker closed every handle.
             throw;
+        }
+    }
+    internal const int SchemaVersion = 6;
+    // Forward-compatible downgrade guard. A newer release migrates into v7+ and
+    // leaves v6 untouched; if an older copy is ever loaded again (Jellyfin can
+    // revive a stale version folder), diffing v6 would announce everything that
+    // changed since the upgrade. Refuse to open instead: no state, no alerts,
+    // and the supervisor reports stateUnavailable until the newer version runs.
+    // Every future schema keeps this check against versions above its own.
+    private static void RefuseNewerSchema(string root)
+    {
+        if (!Directory.Exists(root)) return;
+        foreach (string entry in Directory.EnumerateDirectories(root, "v*", SearchOption.TopDirectoryOnly))
+        {
+            string name = Path.GetFileName(entry);
+            if (name.Length > 1 && name.Length <= 6 && name[1..].All(char.IsAsciiDigit) && int.Parse(name[1..], System.Globalization.CultureInfo.InvariantCulture) > SchemaVersion
+                && File.Exists(Path.Combine(entry, "migration.complete")))
+                throw new NewerStateException();
         }
     }
     private static byte[] Encode<T>(T value)
@@ -258,3 +276,6 @@ public sealed class Journal : IDisposable
 }
 
 public sealed class StatePersistenceException(Exception inner) : IOException("Plugin state could not be written", inner);
+
+// Thrown when state written by a newer plugin release is present.
+internal sealed class NewerStateException() : IOException("Newer notification state present; refusing to diff from an older schema");
